@@ -48,9 +48,9 @@ class NodeHeap:
         self._removed: set = set()
 
     def push(self, node: Node):
-        # 1순위: -node.depth (가장 깊은 노드 = 방금 자르고 남은 직속 잔재 우선)
-        # 2순위: -node.volume (깊이가 같다면 그중에서 가장 큰 공간 우선)
-        heapq.heappush(self._heap, (-node.depth, -node.volume, node.node_id, node))
+        # 2순위의 마이너스(-)를 뺍니다!
+        # 이제 깊이가 같다면 '부피가 작은 공간(방금 자른 슬라이스)'부터 완벽히 채웁니다.
+        heapq.heappush(self._heap, (-node.depth, node.volume, node.node_id, node))
 
     def pop(self) -> Optional[Node]:
         while self._heap:
