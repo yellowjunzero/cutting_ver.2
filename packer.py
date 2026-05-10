@@ -48,8 +48,9 @@ class NodeHeap:
         self._removed: set = set()
 
     def push(self, node: Node):
-        # volume 음수로 변환해 max-heap 효과
-        heapq.heappush(self._heap, (-node.volume, node.node_id, node))
+        # 1순위: -node.depth (가장 깊은 노드 = 방금 자르고 남은 직속 잔재 우선)
+        # 2순위: -node.volume (깊이가 같다면 그중에서 가장 큰 공간 우선)
+        heapq.heappush(self._heap, (-node.depth, -node.volume, node.node_id, node))
 
     def pop(self) -> Optional[Node]:
         while self._heap:
