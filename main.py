@@ -105,7 +105,7 @@ class OptimizeRequest(BaseModel):
                 from itertools import permutations
                 part_orientations = list(set(permutations([part.l, part.w, part.t])))
 
-           fits = False
+            fits = False
             for stock in self.stocks:
                 # 기존: usable_l = stock.l - 2 * trim.x (아래처럼 2 * 삭제)
                 usable_l = stock.l - trim.x
