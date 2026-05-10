@@ -600,11 +600,14 @@ export default function App() {
   const removeStock = (idx) => setStocks((prev) => prev.filter((_, i) => i !== idx));
 
   // ── Part CRUD ──
-  const addPart = () => setParts((prev) => [
-    ...prev,
-    { _uid: uid(), id: `P${prev.length + 1}`, l: 0, w: 0, t: 0, qty: 0,
-      lock_z: false, allow_xy_rotation: true, priority: 0, color: nextColor() }
-  ]);
+  const addPart = () => setParts((prev) => {
+    const color = PART_COLORS[prev.length % PART_COLORS.length];
+    return [
+      ...prev,
+      { _uid: uid(), id: `P${prev.length + 1}`, l: 0, w: 0, t: 0, qty: 0,
+        lock_z: false, allow_xy_rotation: true, priority: 0, color: color }
+    ];
+  });
   const updatePart = (idx, key, val) => setParts((prev) =>
     prev.map((p, i) => i === idx ? { ...p, [key]: val } : p)
   );
