@@ -1,5 +1,5 @@
 """
-packer.py — 탐색 & 배치 엔진 (5초 극한 최적화 GRASP)
+packer.py — 탐색 & 배치 엔진 (Corner-First & 최대 단일 잔재 보존 알고리즘)
 """
 from __future__ import annotations
 
@@ -24,11 +24,14 @@ class NodeHeap:
         self._removed: set = set()
 
     def push(self, node: Node):
-        heapq.heappush(self._heap, (-node.depth, node.volume, node.node_id, node))
+        # ✨ 핵심 개선 1: 구석 몰아넣기 (Corner-First Heuristic)
+        # X, Y, Z 좌표가 0에 가까운 빈 공간부터 무조건 먼저 꺼내어 사용합니다.
+        # 이렇게 하면 부품이 흩어지지 않고 한쪽 모서리부터 테트리스처럼 꽉꽉 채워집니다.
+        heapq.heappush(self._heap, (node.origin.x, node.origin.y, node.origin.z, node.volume, node.node_id, node))
 
     def pop(self) -> Optional[Node]:
         while self._heap:
-            neg_depth, neg_vol, node_id, node = heapq.heappop(self._heap)
+            x, y, z, vol, node_id, node = heapq.heappop(self._heap)
             if node_id in self._removed:
                 continue
             if node.state != NodeState.FREE:
@@ -43,14 +46,13 @@ class NodeHeap:
     def __len__(self) -> int:
         return len(self._heap)
 
-
 @dataclass(order=True)
 class PlacementCandidate:
-    neg_estimated_volume: float  # 1순위: '채우는 부피' 중심 (덩치 큰 부품도 공평하게 점수 획득)
-    linear_waste: float          # 2순위: 톱날 로스 방어
-    part_idx: int                # 3순위: 부품 섞임 방지
-    rotation_penalty: int        
-    neg_max_offcut: float        
+    neg_estimated_volume: float
+    linear_waste: float
+    part_idx: int
+    rotation_penalty: int
+    neg_max_offcut: float
     node_id: str = field(compare=False)
     node: Node = field(compare=False)
     part: Part = field(compare=False)
@@ -61,7 +63,7 @@ _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
 _ALL_ORDERS = list(permutations(_ALL_AXES))
 
 def _offcut_score_for_order(
-    node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, ...], kerf: float, randomize: bool
+    node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, ...], kerf: float
 ) -> Optional[float]:
     remaining = {CutAxis.X: node.dims.l, CutAxis.Y: node.dims.w, CutAxis.Z: node.dims.t}
     part_size = {CutAxis.X: part_dims.l, CutAxis.Y: part_dims.w, CutAxis.Z: part_dims.t}
@@ -98,10 +100,6 @@ def _offcut_score_for_order(
             normalized_short = short_edge / 1000.0
             score = (normalized_short ** 2) * normalized_t * (normalized_l * normalized_w * normalized_t)
             
-            # ✨ 핵심 업그레이드: 점수 흔들기 (동일한 데이터라도 시도할 때마다 다른 각도로 잘라보게 만듦)
-            if randomize:
-                score *= random.uniform(0.6, 1.4)
-            
         if score > max_score:
             max_score = score
             
@@ -109,10 +107,10 @@ def _offcut_score_for_order(
 
     return max_score
 
-def _best_cut_order(node: Node, part_dims: Dims, kerf: float, randomize: bool) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
+def _best_cut_order(node: Node, part_dims: Dims, kerf: float) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
     best_order, best_score = None, -1.0
     for order in _ALL_ORDERS:
-        score = _offcut_score_for_order(node, part_dims, order, kerf, randomize)
+        score = _offcut_score_for_order(node, part_dims, order, kerf)
         if score is None: continue
         if score > best_score:
             best_score = score
@@ -129,7 +127,7 @@ def _axis_waste(total: float, pdim: float, kerf: float) -> float:
     return max(0.0, total - (count * pdim) - (count - 1) * kerf)
 
 def _find_best_candidate(
-    node: Node, remaining_parts: Dict[str, int], parts_by_id: Dict[str, Part], kerf: float, randomize: bool
+    node: Node, remaining_parts: Dict[str, int], parts_by_id: Dict[str, Part], kerf: float
 ) -> Optional[PlacementCandidate]:
     best: Optional[PlacementCandidate] = None
     part_keys = list(remaining_parts.keys())
@@ -148,8 +146,6 @@ def _find_best_candidate(
             est_count = cx * cy * cz  
             
             est_vol = est_count * (orientation.l * orientation.w * orientation.t)
-            if randomize:
-                est_vol *= random.uniform(0.8, 1.2) # 부피 평가도 살짝 흔들어줌
 
             lw_x = _axis_waste(node.dims.l, orientation.l, kerf)
             lw_y = _axis_waste(node.dims.w, orientation.w, kerf)
@@ -158,7 +154,7 @@ def _find_best_candidate(
 
             rot_penalty = 0 if (orientation.l == part.dims.l and orientation.w == part.dims.w and orientation.t == part.dims.t) else (1 if orientation.t == part.dims.t else 2)
 
-            order_result = _best_cut_order(node, orientation, kerf, randomize)
+            order_result = _best_cut_order(node, orientation, kerf)
             if order_result is None: continue
 
             best_order, max_offcut = order_result
@@ -207,7 +203,7 @@ class PackResult:
     free_nodes: List[Node] = field(default_factory=list)
 
 def _pack_parts_single(
-    settings: EngineSettings, stocks: List[Stock], parts: List[Part], randomize: bool
+    settings: EngineSettings, stocks: List[Stock], parts: List[Part]
 ) -> PackResult:
     start = time.perf_counter()
     kerf = settings.kerf
@@ -239,7 +235,7 @@ def _pack_parts_single(
             node = heap.pop()
             if node is None: break
 
-        candidate = _find_best_candidate(node, remaining, parts_by_id, kerf, randomize)
+        candidate = _find_best_candidate(node, remaining, parts_by_id, kerf)
         if candidate is None:
             node.state = NodeState.DISCARDED
             continue
@@ -267,54 +263,50 @@ def pack_parts(
     settings: EngineSettings, stocks: List[Stock], parts: List[Part],
 ) -> PackResult:
     """
-    ✨ 5초 극한 최적화 엔진 (GRASP)
+    ✨ 5초 최적화 엔진 (Corner-First + 최대 단일 잔재 평가)
     """
     start_total = time.perf_counter()
-    TIME_LIMIT = 5.0  # 대표님이 허락하신 5초의 최적화 시간
+    TIME_LIMIT = 5.0  
     
     best_result = None
     best_unplaced = float('inf')
-    best_waste = float('inf')
+    best_largest_offcut = -1.0
     
-    # 1. 무작위성 없는 '정석' 모드로 1회 실행
-    best_result = _pack_parts_single(settings, stocks, parts, randomize=False)
+    # 기본 모드
+    best_result = _pack_parts_single(settings, stocks, parts)
     best_unplaced = sum(best_result.unplaced.values())
-    best_waste = sum(n.volume for n in best_result.free_nodes)
-    
-    if best_unplaced == 0:
-        best_result.processing_time = time.perf_counter() - start_total
-        return best_result
+    # ✨ 핵심 개선 2: 자투리의 총합이 아니라, '단일 최대 크기의 잔재'를 평가합니다.
+    best_largest_offcut = max((n.volume for n in best_result.free_nodes), default=0.0)
 
-    # 2. 정석으로 안 된다면 5초 동안 수백 번 무작위 탐색 시도
+    # GRASP 다중 패스
     while True:
         if time.perf_counter() - start_total > TIME_LIMIT:
             break
             
-        # 부품 우선순위를 매번 다르게 섞습니다.
         test_parts = copy.deepcopy(parts)
         strategy = random.random()
-        if strategy < 0.3:
+        if strategy < 0.2:
             test_parts.sort(key=lambda p: -(p.l * p.w * p.t))
-        elif strategy < 0.6:
+        elif strategy < 0.4:
             test_parts.sort(key=lambda p: -max(p.l, p.w))
+        elif strategy < 0.6:
+            test_parts.sort(key=lambda p: -min(p.l, p.w))
         else:
             random.shuffle(test_parts)
             
         test_stocks = copy.deepcopy(stocks)
         
-        # 무작위성을 부여하여 시뮬레이션
-        result = _pack_parts_single(settings, test_stocks, test_parts, randomize=True)
+        result = _pack_parts_single(settings, test_stocks, test_parts)
         unplaced = sum(result.unplaced.values())
-        waste = sum(n.volume for n in result.free_nodes)
         
-        # 더 나은 결과를 찾으면 갱신 (미배치가 적거나, 미배치가 같은데 쓰레기가 적은 경우)
-        if unplaced < best_unplaced or (unplaced == best_unplaced and waste < best_waste):
+        # 여기서 '단일 최대 잔재 크기'를 구합니다.
+        largest_offcut = max((n.volume for n in result.free_nodes), default=0.0)
+        
+        # 모든 부품이 다 배치되었으면서 && 가장 거대한 하나의 잔재를 남기는 도면을 1등으로 뽑습니다.
+        if unplaced < best_unplaced or (unplaced == best_unplaced and largest_offcut > best_largest_offcut):
             best_unplaced = unplaced
-            best_waste = waste
+            best_largest_offcut = largest_offcut
             best_result = result
             
-            if best_unplaced == 0:
-                break
-
     best_result.processing_time = time.perf_counter() - start_total
     return best_result
