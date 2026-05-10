@@ -6,7 +6,7 @@ import * as THREE from "three";
 // ─────────────────────────────────────────────
 // 상수
 // ─────────────────────────────────────────────
-https://cutting-ver-2.onrender.com
+const API_URL = "https://cutting-ver-2.onrender.com";
 const SCALE = 0.001;       // 1mm → 0.001 three.js unit
 const STOCK_GAP = 0.5;     // 원장 간격 (three.js unit)
 const CAM_X_OFFSET = -0.73; // 사이드바 292px 보정
