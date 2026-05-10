@@ -2,12 +2,6 @@
 packer.py — 탐색 & 배치 엔진
 
 공개 API: pack_parts(settings, stocks, parts) → (List[Node], Dict[str, int])
-
-설계 원칙:
-  - Node-Centric 탐색: 공간(Node) 중심으로 순회하여 자연스러운 혼합 배치 달성
-  - Best-Fit: 낭비(node.volume - part.volume)가 가장 작은 매칭 선택
-  - Max-Offcut: 6가지 절단 순서 중 가장 큰 단일 잔재를 남기는 순서 선택
-  - NodeHeap: 지연 삭제 우선순위 큐 (부피 내림차순)
 """
 
 from __future__ import annotations
@@ -41,15 +35,11 @@ _EPSILON = 0.5  # mm 단위 오차 허용치
 # ─────────────────────────────────────────────
 
 class NodeHeap:
-    """부피 내림차순 min-heap (지연 삭제 방식)"""
-
     def __init__(self):
         self._heap: list = []
         self._removed: set = set()
 
     def push(self, node: Node):
-        # 2순위의 마이너스(-)를 뺍니다!
-        # 이제 깊이가 같다면 '부피가 작은 공간(방금 자른 슬라이스)'부터 완벽히 채웁니다.
         heapq.heappush(self._heap, (-node.depth, node.volume, node.node_id, node))
 
     def pop(self) -> Optional[Node]:
@@ -71,15 +61,16 @@ class NodeHeap:
 
 
 # ─────────────────────────────────────────────
-# 배치 후보 (유연함과 정돈됨의 황금 밸런스)
+# 배치 후보 (정렬 가능)
 # ─────────────────────────────────────────────
 
 @dataclass(order=True)
 class PlacementCandidate:
-    neg_estimated_count: int  # ✨ 1순위: 가장 많이 들어가는 덩어리 찾기 (기둥/띠 형성의 핵심)
-    linear_waste: float       # ✨ 2순위: 덩어리 안에서 발생하는 1차원 쓰레기 최소화 (로스율 방어!)
-    rotation_penalty: int     # ✨ 3순위: 동점이라면, 원래 자르던 방향(회전) 유지 (작업성 고려)
-    neg_max_offcut: float     # ✨ 4순위: 자투리 공간을 잘게 쪼개지 말고 한 덩어리로 크게 남기기
+    part_idx: int             # ✨ 1순위: 부품 순서 강제 (체스판 섞임 절대 금지)
+    neg_estimated_count: int  # ✨ 2순위: 최대 입주 가능 수량
+    linear_waste: float       # 3순위: 선형 쓰레기 최소화
+    rotation_penalty: int     # 4순위: 회전 일관성 유지
+    neg_max_offcut: float     # 5순위: 단일 최대 잔재 크기
     node_id: str = field(compare=False)
     node: Node = field(compare=False)
     part: Part = field(compare=False)
@@ -88,11 +79,11 @@ class PlacementCandidate:
 
 
 # ─────────────────────────────────────────────
-# Max-Offcut 절단 순서 최적화 (현장 실무: 얇은 잔재 억제, 두께 보존)
+# Max-Offcut 절단 순서 최적화 (두께 보존 알고리즘)
 # ─────────────────────────────────────────────
 
 _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
-_ALL_ORDERS = list(permutations(_ALL_AXES))  # 6가지 절단 순서
+_ALL_ORDERS = list(permutations(_ALL_AXES))
 
 def _offcut_score_for_order(
     node: Node,
@@ -100,10 +91,6 @@ def _offcut_score_for_order(
     cut_order: Tuple[CutAxis, ...],
     kerf: float,
 ) -> Optional[float]:
-    """
-    단순 부피가 아닌 '재사용 가치(Reusability Score)'를 계산합니다.
-    얇고 긴 띠(Strip) 형태를 억제하고, 원장의 두께(T) 보존을 최우선으로 합니다.
-    """
     remaining = {
         CutAxis.X: node.dims.l,
         CutAxis.Y: node.dims.w,
@@ -135,11 +122,10 @@ def _offcut_score_for_order(
         
         short_edge = min(rem_l, rem_w)
         
-        if short_edge < 30: # 너무 얇은 폐급 잔재는 점수 0
+        if short_edge < 30:
             score = 0.0
         else:
-            # ✨ 핵심 해결책: rem_t(보존된 두께)를 곱해줍니다!
-            # 두께를 썰어버리면 rem_t가 작아져서 점수가 폭락하므로, 알고리즘은 무조건 블록(X, Y)부터 자르게 됩니다.
+            # ✨ 두께(rem_t)를 곱해주어 넓적하고 두꺼운 블록 형태를 강제함
             score = (short_edge ** 2) * rem_t * (rem_l * rem_w * rem_t)
             
         if score > max_score:
@@ -149,7 +135,6 @@ def _offcut_score_for_order(
 
     return max_score
 
-
 def _best_cut_order(
     node: Node,
     part_dims: Dims,
@@ -158,7 +143,6 @@ def _best_cut_order(
     best_order = None
     best_score = -1.0
 
-    # 6가지 절단 순서를 모두 시뮬레이션하여 가장 '넓적하고 두꺼운' 잔재를 남기는 칼질 순서를 찾습니다.
     for order in _ALL_ORDERS:
         score = _offcut_score_for_order(node, part_dims, order, kerf)
         if score is None:
@@ -175,44 +159,51 @@ def _best_cut_order(
 
 
 # ─────────────────────────────────────────────
-# Best-Fit 후보 선택 (억지 규칙 철폐)
+# Best-Fit 후보 선택
 # ─────────────────────────────────────────────
 
 def _fit_count(total: float, pdim: float, kerf: float) -> int:
-    if pdim > total + _EPSILON: return 0
+    if pdim > total + _EPSILON:
+        return 0
     return int((total + kerf + _EPSILON) // (pdim + kerf))
 
 def _axis_waste(total: float, pdim: float, kerf: float) -> float:
     count = _fit_count(total, pdim, kerf)
-    if count <= 0: return total
+    if count <= 0:
+        return total
     waste = total - (count * pdim) - (count - 1) * kerf
     return max(0.0, waste)
 
 def _find_best_candidate(
-    node: Node, remaining_parts: Dict[str, int], parts_by_id: Dict[str, Part], kerf: float,
+    node: Node,
+    remaining_parts: Dict[str, int],
+    parts_by_id: Dict[str, Part],
+    kerf: float,
 ) -> Optional[PlacementCandidate]:
     best: Optional[PlacementCandidate] = None
+    
+    part_keys = list(remaining_parts.keys())
 
     for part_id, qty in remaining_parts.items():
-        if qty <= 0: continue
+        if qty <= 0:
+            continue
         part = parts_by_id[part_id]
+        p_idx = part_keys.index(part_id)
 
         for orientation in part.allowed_orientations():
-            if not orientation.fits_in(node.dims): continue
+            if not orientation.fits_in(node.dims):
+                continue
 
-            # 1. 덩어리 잠재력 (우선순위 1)
             cx = _fit_count(node.dims.l, orientation.l, kerf)
             cy = _fit_count(node.dims.w, orientation.w, kerf)
             cz = _fit_count(node.dims.t, orientation.t, kerf)
             est_count = cx * cy * cz  
 
-            # 2. 로스율 방어 (우선순위 2)
             lw_x = _axis_waste(node.dims.l, orientation.l, kerf)
             lw_y = _axis_waste(node.dims.w, orientation.w, kerf)
             lw_z = _axis_waste(node.dims.t, orientation.t, kerf)
             total_linear_waste = lw_x + lw_y + lw_z
 
-            # 3. 회전 페널티 (우선순위 3 - 벌점만 부여)
             if orientation.l == part.dims.l and orientation.w == part.dims.w and orientation.t == part.dims.t:
                 rot_penalty = 0
             elif orientation.t == part.dims.t:
@@ -221,10 +212,13 @@ def _find_best_candidate(
                 rot_penalty = 2
 
             order_result = _best_cut_order(node, orientation, kerf)
-            if order_result is None: continue
+            if order_result is None:
+                continue
+
             best_order, max_offcut = order_result
 
             candidate = PlacementCandidate(
+                part_idx=p_idx,                   
                 neg_estimated_count=-est_count,   
                 linear_waste=total_linear_waste,  
                 rotation_penalty=rot_penalty,     
@@ -253,13 +247,6 @@ def _place_part_on_node(
     cut_order: Tuple[CutAxis, ...],
     kerf: float,
 ) -> Tuple[Node, List[Node]]:
-    """
-    node에 part를 orientation 방향으로 배치.
-    최대 3번의 관통 절단 수행 (이미 딱 맞으면 해당 절단 생략).
-
-    Returns:
-        (occupied_node, new_free_nodes)
-    """
     part_size = {
         CutAxis.X: orientation.l,
         CutAxis.Y: orientation.w,
@@ -273,15 +260,13 @@ def _place_part_on_node(
         pos = part_size[axis]
         total = _get_axis(current.dims, axis)
 
-        # 이미 딱 맞으면 절단 생략
         if abs(total - pos) <= _EPSILON:
             continue
 
         child_a, child_b = split_node(current, axis, pos, kerf)
         new_free_nodes.append(child_b)
-        current = child_a  # 계속 child_a를 파고듦
+        current = child_a
 
-    # 최종 리프 노드에 부품 배치
     current.state = NodeState.OCCUPIED
     current.placed_part = part
     current.placed_part_dims = orientation
@@ -290,7 +275,7 @@ def _place_part_on_node(
 
 
 # ─────────────────────────────────────────────
-# 결과 데이터 클래스
+# 결과 데이터 클래스 & 메인 API
 # ─────────────────────────────────────────────
 
 @dataclass
@@ -299,35 +284,18 @@ class PackResult:
     unplaced: Dict[str, int]
     processing_time: float
     stocks_used: int
-    free_nodes: List[Node] = field(default_factory=list)  # ✨ 남은 잔재(빈 공간) 리스트 추가
-
-
-# ─────────────────────────────────────────────
-# 공개 API
-# ─────────────────────────────────────────────
+    free_nodes: List[Node] = field(default_factory=list)
 
 def pack_parts(
     settings: EngineSettings,
     stocks: List[Stock],
     parts: List[Part],
 ) -> PackResult:
-    """
-    메인 패킹 엔진.
-
-    Args:
-        settings: kerf, optimization_goal 등 엔진 설정
-        stocks: 원장 목록
-        parts: 부품 목록
-
-    Returns:
-        PackResult(occupied_nodes, unplaced, processing_time, stocks_used, free_nodes)
-    """
     start = time.perf_counter()
 
     kerf = settings.kerf
     parts_by_id: Dict[str, Part] = {p.id: p for p in parts}
 
-    # 남은 부품 수량 (우선순위 역순으로 정렬: priority 높을수록 먼저)
     remaining: Dict[str, int] = {}
     for p in sorted(parts, key=lambda x: -x.priority):
         remaining[p.id] = p.qty
@@ -336,7 +304,6 @@ def pack_parts(
     heap = NodeHeap()
     stocks_used = 0
 
-    # 원장을 순차적으로 열어가며 처리
     stock_pool: List[Stock] = []
     for stock in stocks:
         for _ in range(stock.qty):
@@ -355,35 +322,28 @@ def pack_parts(
         heap.push(root)
         return True
 
-    # 첫 번째 원장 열기
     if not _open_next_stock():
         return PackResult([], remaining, 0.0, 0)
 
-    # 메인 루프: heap이 빌 때까지
     while True:
-        # 배치할 부품이 남았는지 확인
         if not any(v > 0 for v in remaining.values()):
             break
 
         node = heap.pop()
 
         if node is None:
-            # 현재 heap이 비었으면 다음 원장 열기
             if not _open_next_stock():
                 break
             node = heap.pop()
             if node is None:
                 break
 
-        # 현재 node에 가장 잘 맞는 부품 탐색
         candidate = _find_best_candidate(node, remaining, parts_by_id, kerf)
 
         if candidate is None:
-            # 이 공간에 아무것도 안 들어감 → DISCARD
             node.state = NodeState.DISCARDED
             continue
 
-        # 배치 실행
         occupied, new_free = _place_part_on_node(
             candidate.node,
             candidate.part,
@@ -394,14 +354,12 @@ def pack_parts(
         occupied_nodes.append(occupied)
         remaining[candidate.part.id] -= 1
 
-        # 새 FREE 잔재들을 heap에 등록
         for free_node in new_free:
             heap.push(free_node)
 
-    # ✨ 루프 종료 후, 힙에 남아있는 사용되지 않은 잔재(FREE)들을 긁어모읍니다.
     free_nodes = []
     for item in heap._heap:
-        node = item[-1]  # 튜플의 마지막 요소가 Node 객체
+        node = item[-1]
         if node.node_id not in heap._removed and node.state == NodeState.FREE:
             free_nodes.append(node)
 
@@ -411,5 +369,5 @@ def pack_parts(
         unplaced={k: v for k, v in remaining.items() if v > 0},
         processing_time=elapsed,
         stocks_used=stocks_used,
-        free_nodes=free_nodes,  # ✨ 수집한 잔재 반환
+        free_nodes=free_nodes,
     )
