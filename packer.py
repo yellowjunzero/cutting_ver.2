@@ -76,8 +76,8 @@ class NodeHeap:
 
 @dataclass(order=True)
 class PlacementCandidate:
-    dead_volume: float        # 1순위: 배치 후 발생하는 '사용 불가' 잔재 부피 (작을수록 좋음)
-    neg_max_offcut: float     # 2순위: 단일 최대 잔재 크기 음수 (작을수록=잔재가 클수록 좋음)
+    linear_waste: float       # 1순위: 축별 최종 예상 쓰레기 합산 (작을수록 꽉 끼는 완벽한 배치)
+    neg_max_offcut: float     # 2순위: 단일 최대 잔재 크기 (음수)
     node_id: str = field(compare=False)
     node: Node = field(compare=False)
     part: Part = field(compare=False)
@@ -86,39 +86,18 @@ class PlacementCandidate:
 
 
 # ─────────────────────────────────────────────
-# 잔재 활용성 평가 (핵심 휴리스틱)
+# Max-Offcut 절단 순서 최적화
 # ─────────────────────────────────────────────
 
 _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
 _ALL_ORDERS = list(permutations(_ALL_AXES))  # 6가지
 
-def _can_fit_any(
-    dims: Dims,
-    remaining_parts: Dict[str, int],
-    parts_by_id: Dict[str, Part],
-    current_part_id: str,
-) -> bool:
-    """이 공간(dims)에 남은 부품 중 하나라도 들어갈 수 있는지 확인"""
-    for pid, qty in remaining_parts.items():
-        # 현재 배치하려는 부품은 남은 수량에서 1개를 미리 빼고 생각해야 함
-        available_qty = qty - 1 if pid == current_part_id else qty
-        if available_qty <= 0:
-            continue
-        part = parts_by_id[pid]
-        for orient in part.allowed_orientations():
-            if orient.fits_in(dims):
-                return True
-    return False
-
-def _simulate_cut_order(
+def _offcut_volumes_for_order(
     node: Node,
     part_dims: Dims,
     cut_order: Tuple[CutAxis, ...],
     kerf: float,
-) -> Optional[List[Dims]]:
-    """
-    절단 순서를 시뮬레이션하여 발생하는 잔재(child_b)들의 치수 목록을 반환
-    """
+) -> Optional[Tuple[float, ...]]:
     remaining = {
         CutAxis.X: node.dims.l,
         CutAxis.Y: node.dims.w,
@@ -129,31 +108,67 @@ def _simulate_cut_order(
         CutAxis.Y: part_dims.w,
         CutAxis.Z: part_dims.t,
     }
-    offcuts = []
+    offcut_vols = []
 
     for axis in cut_order:
         pos = part_size[axis]
         total = remaining[axis]
 
-        # 이미 딱 맞으면 절단 생략 (잔재 없음)
         if abs(total - pos) <= _EPSILON:
             remaining[axis] = pos
+            offcut_vols.append(0.0)
             continue
 
         remainder = total - pos - kerf
         if remainder <= 0:
-            return None  # 이 순서로는 물리적으로 절단 불가
+            return None  
 
         b_dims_map = {**remaining, axis: remainder}
-        offcuts.append(Dims(l=b_dims_map[CutAxis.X], w=b_dims_map[CutAxis.Y], t=b_dims_map[CutAxis.Z]))
+        b_vol = (
+            b_dims_map[CutAxis.X]
+            * b_dims_map[CutAxis.Y]
+            * b_dims_map[CutAxis.Z]
+        )
+        offcut_vols.append(b_vol)
         remaining[axis] = pos
 
-    return offcuts
+    return tuple(offcut_vols)
+
+def _best_cut_order(
+    node: Node,
+    part_dims: Dims,
+    kerf: float,
+) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
+    best_order = None
+    best_max_offcut = -1.0
+
+    for order in _ALL_ORDERS:
+        result = _offcut_volumes_for_order(node, part_dims, order, kerf)
+        if result is None:
+            continue
+        max_offcut = max(result) if result else 0.0
+        if max_offcut > best_max_offcut:
+            best_max_offcut = max_offcut
+            best_order = order
+
+    if best_order is None:
+        return None
+    return best_order, best_max_offcut
 
 
 # ─────────────────────────────────────────────
-# Best-Fit 후보 선택 (Dead Space 최소화)
+# Best-Fit 후보 선택 (Linear Waste 기반)
 # ─────────────────────────────────────────────
+
+def _axis_waste(total: float, pdim: float, kerf: float) -> float:
+    """1D 시뮬레이션: 해당 축으로 끝까지 채웠을 때 최종적으로 남는 쓰레기(Waste)"""
+    if pdim > total + _EPSILON:
+        return total
+    count = int((total + kerf + _EPSILON) // (pdim + kerf))
+    if count <= 0:
+        return total
+    waste = total - (count * pdim) - (count - 1) * kerf
+    return max(0.0, waste)
 
 def _find_best_candidate(
     node: Node,
@@ -161,10 +176,6 @@ def _find_best_candidate(
     parts_by_id: Dict[str, Part],
     kerf: float,
 ) -> Optional[PlacementCandidate]:
-    """
-    현재 node에 배치 가능한 가장 최적의 (part, orientation, cut_order) 조합 탐색.
-    Dynamic Mixed Nesting: remaining_parts 전체를 순회하므로 혼합 배치 자동 달성.
-    """
     best: Optional[PlacementCandidate] = None
 
     for part_id, qty in remaining_parts.items():
@@ -173,40 +184,33 @@ def _find_best_candidate(
         part = parts_by_id[part_id]
 
         for orientation in part.allowed_orientations():
-            # 기본 크기 체크
             if not orientation.fits_in(node.dims):
                 continue
 
-            # 6가지 절단 순서 모두 시뮬레이션
-            for order in _ALL_ORDERS:
-                offcuts = _simulate_cut_order(node, orientation, order, kerf)
-                if offcuts is None:
-                    continue
+            # 핵심 지능: "이 방향으로 놓으면 최종 쓰레기가 얼마나 나올까?"를 미리 꿰뚫어 봄
+            lw_x = _axis_waste(node.dims.l, orientation.l, kerf)
+            lw_y = _axis_waste(node.dims.w, orientation.w, kerf)
+            lw_z = _axis_waste(node.dims.t, orientation.t, kerf)
+            total_linear_waste = lw_x + lw_y + lw_z
 
-                dead_vol = 0.0
-                max_offcut = 0.0
+            order_result = _best_cut_order(node, orientation, kerf)
+            if order_result is None:
+                continue
 
-                for offcut in offcuts:
-                    vol = offcut.volume
-                    if vol > max_offcut:
-                        max_offcut = vol
-                    
-                    # 핵심 지능: 이 잔재에 남은 부품 중 들어갈 놈이 없으면 '죽은 공간' 처리!
-                    if not _can_fit_any(offcut, remaining_parts, parts_by_id, part_id):
-                        dead_vol += vol
+            best_order, max_offcut = order_result
 
-                candidate = PlacementCandidate(
-                    dead_volume=dead_vol,
-                    neg_max_offcut=-max_offcut,
-                    node_id=node.node_id,
-                    node=node,
-                    part=part,
-                    orientation=orientation,
-                    cut_order=order,
-                )
+            candidate = PlacementCandidate(
+                linear_waste=total_linear_waste,
+                neg_max_offcut=-max_offcut,
+                node_id=node.node_id,
+                node=node,
+                part=part,
+                orientation=orientation,
+                cut_order=best_order,
+            )
 
-                if best is None or candidate < best:
-                    best = candidate
+            if best is None or candidate < best:
+                best = candidate
 
     return best
 
