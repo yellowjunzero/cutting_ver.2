@@ -105,11 +105,12 @@ class OptimizeRequest(BaseModel):
                 from itertools import permutations
                 part_orientations = list(set(permutations([part.l, part.w, part.t])))
 
-            fits = False
+           fits = False
             for stock in self.stocks:
-                usable_l = stock.l - 2 * trim.x
-                usable_w = stock.w - 2 * trim.y
-                usable_t = stock.t - 2 * trim.z
+                # 기존: usable_l = stock.l - 2 * trim.x (아래처럼 2 * 삭제)
+                usable_l = stock.l - trim.x
+                usable_w = stock.w - trim.y
+                usable_t = stock.t - trim.z
                 if usable_l <= 0 or usable_w <= 0 or usable_t <= 0:
                     continue
                 for pl, pw, pt in part_orientations:
