@@ -222,7 +222,8 @@ def create_root_node(stock: Stock) -> Node:
     """[C3] 트리밍이 반영된 루트 노드 생성"""
     usable = stock.usable_dims
     trim = stock.trimming
-    origin = Point3D(x=trim.x, y=trim.y, z=trim.z)
+    # ✨ 트리밍(양단 합산)을 절반으로 나누어 양쪽 여백으로 균일하게 분배합니다!
+    origin = Point3D(x=trim.x / 2.0, y=trim.y / 2.0, z=trim.z / 2.0)
     return Node(
         node_id=_new_id(),
         dims=usable,
