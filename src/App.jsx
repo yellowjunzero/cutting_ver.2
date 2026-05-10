@@ -22,15 +22,14 @@ const nextColor = () => PART_COLORS[_colorIdx++ % PART_COLORS.length];
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
-const DEFAULT_SETTINGS = { kerf: 3, trimming: { x: 10, y: 10, z: 0 } };
+const DEFAULT_SETTINGS = { kerf: 5, trimming: { x: 0, y: 0, z: 0 } };
 
 const DEFAULT_STOCKS = [
-  { _uid: uid(), id: "S1", l: 2440, w: 1220, t: 18, qty: 2 },
+  { _uid: uid(), id: "S1", l: 0, w: 0, t: 0, qty: 0 },
 ];
 
 const DEFAULT_PARTS = [
-  { _uid: uid(), id: "P1", l: 600, w: 400, t: 18, qty: 8, lock_z: true, allow_xy_rotation: true, priority: 0, color: PART_COLORS[0] },
-  { _uid: uid(), id: "P2", l: 300, w: 250, t: 18, qty: 6, lock_z: true, allow_xy_rotation: true, priority: 0, color: PART_COLORS[1] },
+  { _uid: uid(), id: "P1", l: 0, w: 0, t: 0, qty: 0, lock_z: true, allow_xy_rotation: true, priority: 0, color: PART_COLORS[0] },
 ];
 
 // ─────────────────────────────────────────────
@@ -543,7 +542,7 @@ export default function App() {
   // ── Stock CRUD ──
   const addStock = () => setStocks((prev) => [
     ...prev,
-    { _uid: uid(), id: `S${prev.length + 1}`, l: 2440, w: 1220, t: 18, qty: 1 }
+    { _uid: uid(), id: `S${prev.length + 1}`, l: 0, w: 0, t: 0, qty: 0 }
   ]);
   const updateStock = (idx, key, val) => setStocks((prev) =>
     prev.map((s, i) => i === idx ? { ...s, [key]: val } : s)
@@ -553,8 +552,8 @@ export default function App() {
   // ── Part CRUD ──
   const addPart = () => setParts((prev) => [
     ...prev,
-    { _uid: uid(), id: `P${prev.length + 1}`, l: 400, w: 300, t: 18, qty: 4,
-      lock_z: true, allow_xy_rotation: true, priority: 0, color: nextColor() }
+    { _uid: uid(), id: `P${prev.length + 1}`, l: 0, w: 0, t: 0, qty: 0,
+      lock_z: false, allow_xy_rotation: true, priority: 0, color: nextColor() }
   ]);
   const updatePart = (idx, key, val) => setParts((prev) =>
     prev.map((p, i) => i === idx ? { ...p, [key]: val } : p)
@@ -655,10 +654,14 @@ export default function App() {
               </div>
               <div style={{ fontSize: 10, color: "#475569", marginBottom: 6, letterSpacing: 1 }}>TRIMMING (양단 합산)</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6 }}>
-                {["x","y","z"].map((ax) => (
-                  <NumberInput key={ax} label={`T-${ax.toUpperCase()}`}
-                    value={settings.trimming[ax]}
-                    onChange={(v) => setSettings((s) => ({ ...s, trimming: { ...s.trimming, [ax]: v } }))}
+                {[
+                  { axis: "z", label: "T-T" },
+                  { axis: "y", label: "T-W" },
+                  { axis: "x", label: "T-L" }
+                ].map(({ axis, label }) => (
+                  <NumberInput key={axis} label={label}
+                    value={settings.trimming[axis]}
+                    onChange={(v) => setSettings((s) => ({ ...s, trimming: { ...s.trimming, [axis]: v } }))}
                   />
                 ))}
               </div>
