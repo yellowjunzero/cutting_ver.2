@@ -71,16 +71,15 @@ class NodeHeap:
 
 
 # ─────────────────────────────────────────────
-# 배치 후보 (정렬 가능)
+# 배치 후보 (유연함과 정돈됨의 황금 밸런스)
 # ─────────────────────────────────────────────
 
 @dataclass(order=True)
 class PlacementCandidate:
-    part_idx: int             # ✨ 1순위: 부품 순서 강제 (다른 부품 끼어들기 절대 금지)
-    neg_estimated_count: int  # ✨ 2순위: 최대 입주 가능 수량 (통일된 기둥과 띠 형성의 핵심)
-    linear_waste: float       # 3순위: 선형 쓰레기 최소화
-    rotation_penalty: int     # 4순위: 회전 일관성 유지 (돌리지 마!)
-    neg_max_offcut: float     # 5순위: 단일 최대 잔재 크기 (음수)
+    neg_estimated_count: int  # ✨ 1순위: 가장 많이 들어가는 덩어리 찾기 (기둥/띠 형성의 핵심)
+    linear_waste: float       # ✨ 2순위: 덩어리 안에서 발생하는 1차원 쓰레기 최소화 (로스율 방어!)
+    rotation_penalty: int     # ✨ 3순위: 동점이라면, 원래 자르던 방향(회전) 유지 (작업성 고려)
+    neg_max_offcut: float     # ✨ 4순위: 자투리 공간을 잘게 쪼개지 말고 한 덩어리로 크게 남기기
     node_id: str = field(compare=False)
     node: Node = field(compare=False)
     part: Part = field(compare=False)
@@ -89,145 +88,92 @@ class PlacementCandidate:
 
 
 # ─────────────────────────────────────────────
-# Max-Offcut 절단 순서 최적화 (현장 실무: 얇고 긴 잔재 억제)
+# Max-Offcut 절단 순서 (모든 방향의 유연성 부활!)
 # ─────────────────────────────────────────────
 
 _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
-_ALL_ORDERS = list(permutations(_ALL_AXES))  # 6가지 절단 순서
+_ALL_ORDERS = list(permutations(_ALL_AXES))  # 6가지 절단 순서를 다시 모두 허용합니다!
 
-def _offcut_score_for_order(
-    node: Node,
-    part_dims: Dims,
-    cut_order: Tuple[CutAxis, ...],
-    kerf: float,
-) -> Optional[float]:
-    """
-    단순 부피가 아닌 '재사용 가치(Reusability Score)'를 계산합니다.
-    얇고 긴 띠(Strip) 형태의 잔재에는 강력한 페널티를 부여합니다.
-    """
-    remaining = {
-        CutAxis.X: node.dims.l,
-        CutAxis.Y: node.dims.w,
-        CutAxis.Z: node.dims.t,
-    }
-    part_size = {
-        CutAxis.X: part_dims.l,
-        CutAxis.Y: part_dims.w,
-        CutAxis.Z: part_dims.t,
-    }
-    
-    max_score = -1.0
+def _offcut_volumes_for_order(
+    node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, ...], kerf: float,
+) -> Optional[Tuple[float, ...]]:
+    remaining = {CutAxis.X: node.dims.l, CutAxis.Y: node.dims.w, CutAxis.Z: node.dims.t}
+    part_size = {CutAxis.X: part_dims.l, CutAxis.Y: part_dims.w, CutAxis.Z: part_dims.t}
+    offcut_vols = []
 
     for axis in cut_order:
         pos = part_size[axis]
         total = remaining[axis]
-
-        # 딱 맞게 잘리면 잔재 발생 안 함
         if abs(total - pos) <= _EPSILON:
             remaining[axis] = pos
+            offcut_vols.append(0.0)
             continue
-
         remainder = total - pos - kerf
-        if remainder <= 0:
-            return None  
-
-        # 잘려나간 후 남은 잔재의 3차원 치수
-        rem_l = remaining[CutAxis.X] if axis != CutAxis.X else remainder
-        rem_w = remaining[CutAxis.Y] if axis != CutAxis.Y else remainder
-        rem_t = remaining[CutAxis.Z] if axis != CutAxis.Z else remainder
+        if remainder <= 0: return None  
         
-        # [핵심] 재사용 가치 = "가장 짧은 변(폭/길이 중)"을 기준으로 평가
-        # 두께(T)는 보통 고정이므로, 평면(L, W) 중 짧은 쪽을 찾습니다.
-        short_edge = min(rem_l, rem_w)
-        
-        # 현장에서 재사용이 사실상 불가능한 얇은 폭 (예: 50mm 이하)은 가치를 0으로 처리 (버리는 셈 침)
-        if short_edge < 50:
-            score = 0.0
-        else:
-            # 짧은 변이 넓을수록(정사각형에 가까울수록) + 덩어리 부피가 클수록 높은 점수
-            # short_edge를 제곱하여 '넓적한 형태'에 압도적인 가산점을 줍니다.
-            score = (short_edge ** 2) * (rem_l * rem_w * rem_t)
-            
-        if score > max_score:
-            max_score = score
-            
+        b_dims_map = {**remaining, axis: remainder}
+        b_vol = b_dims_map[CutAxis.X] * b_dims_map[CutAxis.Y] * b_dims_map[CutAxis.Z]
+        offcut_vols.append(b_vol)
         remaining[axis] = pos
 
-    return max_score
+    return tuple(offcut_vols)
 
-def _best_cut_order(
-    node: Node,
-    part_dims: Dims,
-    kerf: float,
-) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
+def _best_cut_order(node: Node, part_dims: Dims, kerf: float) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
     best_order = None
-    best_score = -1.0
+    best_max_offcut = -1.0
 
-    # 6가지 절단 순서를 모두 시뮬레이션하여 가장 '넓적하고 쓸모 있는' 잔재를 남기는 칼질 순서를 찾습니다.
+    # 유연하게 6가지를 다 찔러보고, 가장 자투리가 크게 남는 칼질 순서를 지능적으로 선택합니다.
     for order in _ALL_ORDERS:
-        score = _offcut_score_for_order(node, part_dims, order, kerf)
-        if score is None:
-            continue
-        
-        if score > best_score:
-            best_score = score
+        result = _offcut_volumes_for_order(node, part_dims, order, kerf)
+        if result is None: continue
+        max_offcut = max(result) if result else 0.0
+        if max_offcut > best_max_offcut:
+            best_max_offcut = max_offcut
             best_order = order
 
-    if best_order is None:
-        return None
-        
-    return best_order, best_score
+    if best_order is None: return None
+    return best_order, best_max_offcut
 
 
 # ─────────────────────────────────────────────
-# Best-Fit 후보 선택 (현장 맞춤형 그룹핑)
+# Best-Fit 후보 선택 (억지 규칙 철폐)
 # ─────────────────────────────────────────────
 
 def _fit_count(total: float, pdim: float, kerf: float) -> int:
-    if pdim > total + _EPSILON:
-        return 0
+    if pdim > total + _EPSILON: return 0
     return int((total + kerf + _EPSILON) // (pdim + kerf))
 
 def _axis_waste(total: float, pdim: float, kerf: float) -> float:
     count = _fit_count(total, pdim, kerf)
-    if count <= 0:
-        return total
+    if count <= 0: return total
     waste = total - (count * pdim) - (count - 1) * kerf
     return max(0.0, waste)
 
 def _find_best_candidate(
-    node: Node,
-    remaining_parts: Dict[str, int],
-    parts_by_id: Dict[str, Part],
-    kerf: float,
+    node: Node, remaining_parts: Dict[str, int], parts_by_id: Dict[str, Part], kerf: float,
 ) -> Optional[PlacementCandidate]:
     best: Optional[PlacementCandidate] = None
-    
-    part_keys = list(remaining_parts.keys())
 
     for part_id, qty in remaining_parts.items():
-        if qty <= 0:
-            continue
+        if qty <= 0: continue
         part = parts_by_id[part_id]
-        p_idx = part_keys.index(part_id)  # 부품 인덱스 (섞임 방지용)
 
         for orientation in part.allowed_orientations():
-            if not orientation.fits_in(node.dims):
-                continue
+            if not orientation.fits_in(node.dims): continue
 
-            # ✨ 1. 예상 최대 수량 (Grid 형성의 핵심 잠재력)
+            # 1. 덩어리 잠재력 (우선순위 1)
             cx = _fit_count(node.dims.l, orientation.l, kerf)
             cy = _fit_count(node.dims.w, orientation.w, kerf)
             cz = _fit_count(node.dims.t, orientation.t, kerf)
             est_count = cx * cy * cz  
 
-            # 2. 선형 쓰레기 시뮬레이션
+            # 2. 로스율 방어 (우선순위 2)
             lw_x = _axis_waste(node.dims.l, orientation.l, kerf)
             lw_y = _axis_waste(node.dims.w, orientation.w, kerf)
             lw_z = _axis_waste(node.dims.t, orientation.t, kerf)
             total_linear_waste = lw_x + lw_y + lw_z
 
-            # 3. 회전 페널티 계산
+            # 3. 회전 페널티 (우선순위 3 - 벌점만 부여)
             if orientation.l == part.dims.l and orientation.w == part.dims.w and orientation.t == part.dims.t:
                 rot_penalty = 0
             elif orientation.t == part.dims.t:
@@ -236,17 +182,14 @@ def _find_best_candidate(
                 rot_penalty = 2
 
             order_result = _best_cut_order(node, orientation, kerf)
-            if order_result is None:
-                continue
-
+            if order_result is None: continue
             best_order, max_offcut = order_result
 
             candidate = PlacementCandidate(
-                part_idx=p_idx,                   # 1순위: 다른 부품 섞지 마!
-                neg_estimated_count=-est_count,   # 2순위: 무조건 크게 덩어리 묶어!
-                linear_waste=total_linear_waste,  # 3순위: 쓰레기 최소화
-                rotation_penalty=rot_penalty,     # 4순위: 돌리지 마!
-                neg_max_offcut=-max_offcut,       # 5순위: 잔재 크게 남기기
+                neg_estimated_count=-est_count,   
+                linear_waste=total_linear_waste,  
+                rotation_penalty=rot_penalty,     
+                neg_max_offcut=-max_offcut,       
                 node_id=node.node_id,
                 node=node,
                 part=part,
