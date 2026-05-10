@@ -88,51 +88,90 @@ class PlacementCandidate:
 
 
 # ─────────────────────────────────────────────
-# Max-Offcut 절단 순서 (모든 방향의 유연성 부활!)
+# Max-Offcut 절단 순서 최적화 (현장 실무: 얇은 잔재 억제, 두께 보존)
 # ─────────────────────────────────────────────
 
 _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
-_ALL_ORDERS = list(permutations(_ALL_AXES))  # 6가지 절단 순서를 다시 모두 허용합니다!
+_ALL_ORDERS = list(permutations(_ALL_AXES))  # 6가지 절단 순서
 
-def _offcut_volumes_for_order(
-    node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, ...], kerf: float,
-) -> Optional[Tuple[float, ...]]:
-    remaining = {CutAxis.X: node.dims.l, CutAxis.Y: node.dims.w, CutAxis.Z: node.dims.t}
-    part_size = {CutAxis.X: part_dims.l, CutAxis.Y: part_dims.w, CutAxis.Z: part_dims.t}
-    offcut_vols = []
+def _offcut_score_for_order(
+    node: Node,
+    part_dims: Dims,
+    cut_order: Tuple[CutAxis, ...],
+    kerf: float,
+) -> Optional[float]:
+    """
+    단순 부피가 아닌 '재사용 가치(Reusability Score)'를 계산합니다.
+    얇고 긴 띠(Strip) 형태를 억제하고, 원장의 두께(T) 보존을 최우선으로 합니다.
+    """
+    remaining = {
+        CutAxis.X: node.dims.l,
+        CutAxis.Y: node.dims.w,
+        CutAxis.Z: node.dims.t,
+    }
+    part_size = {
+        CutAxis.X: part_dims.l,
+        CutAxis.Y: part_dims.w,
+        CutAxis.Z: part_dims.t,
+    }
+    
+    max_score = -1.0
 
     for axis in cut_order:
         pos = part_size[axis]
         total = remaining[axis]
+
         if abs(total - pos) <= _EPSILON:
             remaining[axis] = pos
-            offcut_vols.append(0.0)
             continue
+
         remainder = total - pos - kerf
-        if remainder <= 0: return None  
+        if remainder <= 0:
+            return None  
+
+        rem_l = remaining[CutAxis.X] if axis != CutAxis.X else remainder
+        rem_w = remaining[CutAxis.Y] if axis != CutAxis.Y else remainder
+        rem_t = remaining[CutAxis.Z] if axis != CutAxis.Z else remainder
         
-        b_dims_map = {**remaining, axis: remainder}
-        b_vol = b_dims_map[CutAxis.X] * b_dims_map[CutAxis.Y] * b_dims_map[CutAxis.Z]
-        offcut_vols.append(b_vol)
+        short_edge = min(rem_l, rem_w)
+        
+        if short_edge < 30: # 너무 얇은 폐급 잔재는 점수 0
+            score = 0.0
+        else:
+            # ✨ 핵심 해결책: rem_t(보존된 두께)를 곱해줍니다!
+            # 두께를 썰어버리면 rem_t가 작아져서 점수가 폭락하므로, 알고리즘은 무조건 블록(X, Y)부터 자르게 됩니다.
+            score = (short_edge ** 2) * rem_t * (rem_l * rem_w * rem_t)
+            
+        if score > max_score:
+            max_score = score
+            
         remaining[axis] = pos
 
-    return tuple(offcut_vols)
+    return max_score
 
-def _best_cut_order(node: Node, part_dims: Dims, kerf: float) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
+
+def _best_cut_order(
+    node: Node,
+    part_dims: Dims,
+    kerf: float,
+) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
     best_order = None
-    best_max_offcut = -1.0
+    best_score = -1.0
 
-    # 유연하게 6가지를 다 찔러보고, 가장 자투리가 크게 남는 칼질 순서를 지능적으로 선택합니다.
+    # 6가지 절단 순서를 모두 시뮬레이션하여 가장 '넓적하고 두꺼운' 잔재를 남기는 칼질 순서를 찾습니다.
     for order in _ALL_ORDERS:
-        result = _offcut_volumes_for_order(node, part_dims, order, kerf)
-        if result is None: continue
-        max_offcut = max(result) if result else 0.0
-        if max_offcut > best_max_offcut:
-            best_max_offcut = max_offcut
+        score = _offcut_score_for_order(node, part_dims, order, kerf)
+        if score is None:
+            continue
+        
+        if score > best_score:
+            best_score = score
             best_order = order
 
-    if best_order is None: return None
-    return best_order, best_max_offcut
+    if best_order is None:
+        return None
+        
+    return best_order, best_score
 
 
 # ─────────────────────────────────────────────
