@@ -61,16 +61,16 @@ class NodeHeap:
 
 
 # ─────────────────────────────────────────────
-# 배치 후보 (수율과 작업성의 황금 밸런스)
+# 배치 후보 (부피 중심의 공평한 경쟁)
 # ─────────────────────────────────────────────
 
 @dataclass(order=True)
 class PlacementCandidate:
-    neg_estimated_count: int  # ✨ 1순위: 이 공간에 최대한 많이 뭉칠 수 있는 부품을 찾아라! (자연스러운 블록 형성)
-    linear_waste: float       # ✨ 2순위: 톱날 로스나 틈새 쓰레기를 최소화하라!
-    part_idx: int             # ✨ 3순위: 앞의 조건이 비슷하다면, 이왕이면 원래 자르던 부품을 이어서 잘라라! (난잡한 섞임 방지)
-    rotation_penalty: int     # 4순위: 돌리지 마!
-    neg_max_offcut: float     # 5순위: 단일 최대 잔재 크기
+    neg_estimated_volume: float  # ✨ 1순위: '개수'가 아닌 '채우는 부피'로 경쟁! (큰 부품도 우선권 획득)
+    linear_waste: float          # 2순위: 쓰레기 최소화
+    part_idx: int                # 3순위: 종류별 블록화 (섞임 방지)
+    rotation_penalty: int        # 4순위: 회전 페널티
+    neg_max_offcut: float        # 5순위: 잔재 크게 남기기
     node_id: str = field(compare=False)
     node: Node = field(compare=False)
     part: Part = field(compare=False)
@@ -79,7 +79,7 @@ class PlacementCandidate:
 
 
 # ─────────────────────────────────────────────
-# Max-Offcut 절단 순서 최적화 (두께 보존 알고리즘)
+# Max-Offcut 절단 순서 최적화 (딱 맞는 절단 버그 수정!)
 # ─────────────────────────────────────────────
 
 _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
@@ -91,17 +91,8 @@ def _offcut_score_for_order(
     cut_order: Tuple[CutAxis, ...],
     kerf: float,
 ) -> Optional[float]:
-    remaining = {
-        CutAxis.X: node.dims.l,
-        CutAxis.Y: node.dims.w,
-        CutAxis.Z: node.dims.t,
-    }
-    part_size = {
-        CutAxis.X: part_dims.l,
-        CutAxis.Y: part_dims.w,
-        CutAxis.Z: part_dims.t,
-    }
-    
+    remaining = { CutAxis.X: node.dims.l, CutAxis.Y: node.dims.w, CutAxis.Z: node.dims.t }
+    part_size = { CutAxis.X: part_dims.l, CutAxis.Y: part_dims.w, CutAxis.Z: part_dims.t }
     max_score = -1.0
 
     for axis in cut_order:
@@ -113,8 +104,15 @@ def _offcut_score_for_order(
             continue
 
         remainder = total - pos - kerf
-        if remainder <= 0:
+        
+        # ✨ 버그 수정: remainder가 0인 경우(딱 맞음)를 실패로 처리하지 않고 허용합니다.
+        if remainder < -_EPSILON:
             return None  
+
+        # 딱 맞게 잘려서 남는 공간이 없을 때
+        if remainder <= _EPSILON:
+            remaining[axis] = pos
+            continue
 
         rem_l = remaining[CutAxis.X] if axis != CutAxis.X else remainder
         rem_w = remaining[CutAxis.Y] if axis != CutAxis.Y else remainder
@@ -125,8 +123,11 @@ def _offcut_score_for_order(
         if short_edge < 30:
             score = 0.0
         else:
-            # ✨ 두께(rem_t)를 곱해주어 넓적하고 두꺼운 블록 형태를 강제함
-            score = (short_edge ** 2) * rem_t * (rem_l * rem_w * rem_t)
+            normalized_l = rem_l / 1000.0
+            normalized_w = rem_w / 1000.0
+            normalized_t = rem_t / 1000.0
+            normalized_short = short_edge / 1000.0
+            score = (normalized_short ** 2) * normalized_t * (normalized_l * normalized_w * normalized_t)
             
         if score > max_score:
             max_score = score
@@ -135,27 +136,15 @@ def _offcut_score_for_order(
 
     return max_score
 
-def _best_cut_order(
-    node: Node,
-    part_dims: Dims,
-    kerf: float,
-) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
-    best_order = None
-    best_score = -1.0
-
+def _best_cut_order(node: Node, part_dims: Dims, kerf: float) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
+    best_order, best_score = None, -1.0
     for order in _ALL_ORDERS:
         score = _offcut_score_for_order(node, part_dims, order, kerf)
-        if score is None:
-            continue
-        
+        if score is None: continue
         if score > best_score:
             best_score = score
             best_order = order
-
-    if best_order is None:
-        return None
-        
-    return best_order, best_score
+    return (best_order, best_score) if best_order else None
 
 
 # ─────────────────────────────────────────────
@@ -163,71 +152,56 @@ def _best_cut_order(
 # ─────────────────────────────────────────────
 
 def _fit_count(total: float, pdim: float, kerf: float) -> int:
-    if pdim > total + _EPSILON:
-        return 0
+    if pdim > total + _EPSILON: return 0
     return int((total + kerf + _EPSILON) // (pdim + kerf))
 
 def _axis_waste(total: float, pdim: float, kerf: float) -> float:
     count = _fit_count(total, pdim, kerf)
-    if count <= 0:
-        return total
-    waste = total - (count * pdim) - (count - 1) * kerf
-    return max(0.0, waste)
+    if count <= 0: return total
+    return max(0.0, total - (count * pdim) - (count - 1) * kerf)
 
 def _find_best_candidate(
-    node: Node,
-    remaining_parts: Dict[str, int],
-    parts_by_id: Dict[str, Part],
-    kerf: float,
+    node: Node, remaining_parts: Dict[str, int], parts_by_id: Dict[str, Part], kerf: float,
 ) -> Optional[PlacementCandidate]:
     best: Optional[PlacementCandidate] = None
-    
     part_keys = list(remaining_parts.keys())
 
     for part_id, qty in remaining_parts.items():
-        if qty <= 0:
-            continue
+        if qty <= 0: continue
         part = parts_by_id[part_id]
         p_idx = part_keys.index(part_id)
 
         for orientation in part.allowed_orientations():
-            if not orientation.fits_in(node.dims):
-                continue
+            if not orientation.fits_in(node.dims): continue
 
             cx = _fit_count(node.dims.l, orientation.l, kerf)
             cy = _fit_count(node.dims.w, orientation.w, kerf)
             cz = _fit_count(node.dims.t, orientation.t, kerf)
             est_count = cx * cy * cz  
+            
+            # ✨ 수정: 개수가 아닌 '차지하는 부피'로 계산
+            est_vol = est_count * (orientation.l * orientation.w * orientation.t)
 
             lw_x = _axis_waste(node.dims.l, orientation.l, kerf)
             lw_y = _axis_waste(node.dims.w, orientation.w, kerf)
             lw_z = _axis_waste(node.dims.t, orientation.t, kerf)
             total_linear_waste = lw_x + lw_y + lw_z
 
-            if orientation.l == part.dims.l and orientation.w == part.dims.w and orientation.t == part.dims.t:
-                rot_penalty = 0
-            elif orientation.t == part.dims.t:
-                rot_penalty = 1
-            else:
-                rot_penalty = 2
+            rot_penalty = 0 if (orientation.l == part.dims.l and orientation.w == part.dims.w and orientation.t == part.dims.t) else (1 if orientation.t == part.dims.t else 2)
 
             order_result = _best_cut_order(node, orientation, kerf)
-            if order_result is None:
-                continue
+            if order_result is None: continue
 
             best_order, max_offcut = order_result
 
             candidate = PlacementCandidate(
-                neg_estimated_count=-est_count,   # 1순위
-                linear_waste=total_linear_waste,  # 2순위
-                part_idx=p_idx,                   # 3순위
-                rotation_penalty=rot_penalty,     # 4순위
-                neg_max_offcut=-max_offcut,       # 5순위
-                node_id=node.node_id,
-                node=node,
-                part=part,
-                orientation=orientation,
-                cut_order=best_order,
+                neg_estimated_volume=-est_vol,  # 부피 경쟁
+                linear_waste=total_linear_waste,
+                part_idx=p_idx,                 
+                rotation_penalty=rot_penalty,   
+                neg_max_offcut=-max_offcut,     
+                node_id=node.node_id, node=node, part=part,
+                orientation=orientation, cut_order=best_order,
             )
 
             if best is None or candidate < best:
@@ -237,32 +211,20 @@ def _find_best_candidate(
 
 
 # ─────────────────────────────────────────────
-# 3단계 순차 관통 절단
+# 순차 관통 절단
 # ─────────────────────────────────────────────
 
 def _place_part_on_node(
-    node: Node,
-    part: Part,
-    orientation: Dims,
-    cut_order: Tuple[CutAxis, ...],
-    kerf: float,
+    node: Node, part: Part, orientation: Dims, cut_order: Tuple[CutAxis, ...], kerf: float,
 ) -> Tuple[Node, List[Node]]:
-    part_size = {
-        CutAxis.X: orientation.l,
-        CutAxis.Y: orientation.w,
-        CutAxis.Z: orientation.t,
-    }
-
+    part_size = { CutAxis.X: orientation.l, CutAxis.Y: orientation.w, CutAxis.Z: orientation.t }
     current = node
-    new_free_nodes: List[Node] = []
+    new_free_nodes = []
 
     for axis in cut_order:
         pos = part_size[axis]
         total = _get_axis(current.dims, axis)
-
-        if abs(total - pos) <= _EPSILON:
-            continue
-
+        if abs(total - pos) <= _EPSILON: continue
         child_a, child_b = split_node(current, axis, pos, kerf)
         new_free_nodes.append(child_b)
         current = child_a
@@ -270,8 +232,123 @@ def _place_part_on_node(
     current.state = NodeState.OCCUPIED
     current.placed_part = part
     current.placed_part_dims = orientation
-
     return current, new_free_nodes
+
+
+# ─────────────────────────────────────────────
+# ✨ 싱글 패스 엔진 (기존의 pack_parts)
+# ─────────────────────────────────────────────
+
+def _pack_parts_single(
+    settings: EngineSettings, stocks: List[Stock], parts: List[Part],
+) -> PackResult:
+    start = time.perf_counter()
+    kerf = settings.kerf
+    parts_by_id = {p.id: p for p in parts}
+    
+    remaining = {p.id: p.qty for p in parts}
+    occupied_nodes = []
+    heap = NodeHeap()
+    stocks_used = 0
+
+    stock_pool = [stock for stock in stocks for _ in range(stock.qty)]
+    stock_index = 0
+
+    def _open_next_stock() -> bool:
+        nonlocal stock_index, stocks_used
+        if stock_index >= len(stock_pool): return False
+        stock = stock_pool[stock_index]
+        stock_index += 1
+        stocks_used += 1
+        heap.push(create_root_node(stock))
+        return True
+
+    if not _open_next_stock():
+        return PackResult([], remaining, 0.0, 0)
+
+    while any(v > 0 for v in remaining.values()):
+        node = heap.pop()
+        if node is None:
+            if not _open_next_stock(): break
+            node = heap.pop()
+            if node is None: break
+
+        candidate = _find_best_candidate(node, remaining, parts_by_id, kerf)
+        if candidate is None:
+            node.state = NodeState.DISCARDED
+            continue
+
+        occupied, new_free = _place_part_on_node(
+            candidate.node, candidate.part, candidate.orientation, candidate.cut_order, kerf
+        )
+        occupied_nodes.append(occupied)
+        remaining[candidate.part.id] -= 1
+
+        for free_node in new_free:
+            heap.push(free_node)
+
+    free_nodes = [item[-1] for item in heap._heap if item[-1].node_id not in heap._removed and item[-1].state == NodeState.FREE]
+    
+    return PackResult(
+        occupied_nodes=occupied_nodes,
+        unplaced={k: v for k, v in remaining.items() if v > 0},
+        processing_time=time.perf_counter() - start,
+        stocks_used=stocks_used,
+        free_nodes=free_nodes,
+    )
+
+
+# ─────────────────────────────────────────────
+# ✨ 멀티 패스 래퍼 (최적의 평행우주를 찾아라!)
+# ─────────────────────────────────────────────
+import copy
+
+@dataclass
+class PackResult:
+    occupied_nodes: List[Node]
+    unplaced: Dict[str, int]
+    processing_time: float
+    stocks_used: int
+    free_nodes: List[Node] = field(default_factory=list)
+
+def pack_parts(
+    settings: EngineSettings, stocks: List[Stock], parts: List[Part],
+) -> PackResult:
+    """
+    여러 가지 정렬 방식을 테스트하고 가장 성적이 좋은(미배치가 적은) 결과를 반환합니다.
+    """
+    best_result = None
+    best_unplaced = float('inf')
+    
+    # 3가지 시나리오로 가상 절단을 진행합니다.
+    strategies = [
+        sorted(parts, key=lambda p: -(p.l * p.w * p.t)), # 1. 부피가 큰 놈부터 (수율 최강)
+        sorted(parts, key=lambda p: -max(p.l, p.w)),     # 2. 길이가 긴 놈부터 (Strip 보존)
+        sorted(parts, key=lambda p: -p.priority)         # 3. 사용자 입력 순서
+    ]
+
+    start_total = time.perf_counter()
+
+    for strategy_parts in strategies:
+        # 원본 데이터 오염 방지
+        test_stocks = copy.deepcopy(stocks)
+        test_parts = copy.deepcopy(strategy_parts)
+        
+        result = _pack_parts_single(settings, test_stocks, test_parts)
+        unplaced_count = sum(result.unplaced.values())
+        
+        # 현재 시나리오가 가장 미배치 수량이 적다면 1등 갱신
+        if unplaced_count < best_unplaced:
+            best_unplaced = unplaced_count
+            best_result = result
+        
+        # 잔재 하나 없이 완벽하게 다 넣었다면 더 이상 계산할 필요 없음
+        if best_unplaced == 0:
+            break
+
+    # 최종 연산 시간 보정 후 반환
+    best_result.processing_time = time.perf_counter() - start_total
+    return best_result
 
 
 # ─────────────────────────────────────────────
