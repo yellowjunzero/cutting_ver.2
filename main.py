@@ -107,7 +107,6 @@ class OptimizeRequest(BaseModel):
 
             fits = False
             for stock in self.stocks:
-                # 기존: usable_l = stock.l - 2 * trim.x (아래처럼 2 * 삭제)
                 usable_l = stock.l - trim.x
                 usable_w = stock.w - trim.y
                 usable_t = stock.t - trim.z
@@ -147,6 +146,13 @@ class OriginOut(BaseModel):
     z: float
 
 
+class OffcutOut(BaseModel):
+    node_id: str
+    stock_id: str
+    dims: DimsOut
+    origin: OriginOut
+
+
 class CutRecordOut(BaseModel):
     cut_id: str
     axis: str
@@ -178,6 +184,7 @@ class StockSummaryOut(BaseModel):
 
 class OptimizeResponse(BaseModel):
     placements: List[PlacedPartOut]
+    offcuts: List[OffcutOut]
     unplaced: Dict[str, int]
     stock_summaries: List[StockSummaryOut]
     failures: List[str]   # 사용자 친화적 실패 사유
@@ -361,6 +368,16 @@ async def optimize(body: OptimizeRequest) -> OptimizeResponse:
     placements = [_node_to_placed_out(n) for n in result.occupied_nodes]
     summaries = _build_stock_summaries(result.occupied_nodes, stocks)
 
+    # ✨ 프론트엔드 투명 박스 렌더링을 위한 잔재 데이터 매핑
+    offcuts = []
+    for n in result.free_nodes:
+        offcuts.append(OffcutOut(
+            node_id=n.node_id,
+            stock_id=n.stock_id or "",
+            dims=DimsOut(l=n.dims.l, w=n.dims.w, t=n.dims.t, volume=n.dims.volume),
+            origin=OriginOut(x=n.origin.x, y=n.origin.y, z=n.origin.z)
+        ))
+
     # 미배치 사유 생성
     failures = []
     for part_id, qty in result.unplaced.items():
@@ -385,6 +402,7 @@ async def optimize(body: OptimizeRequest) -> OptimizeResponse:
 
     return OptimizeResponse(
         placements=placements,
+        offcuts=offcuts,
         unplaced=result.unplaced,
         stock_summaries=summaries,
         failures=failures,
