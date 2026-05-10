@@ -76,9 +76,10 @@ class NodeHeap:
 
 @dataclass(order=True)
 class PlacementCandidate:
-    linear_waste: float       # 1순위: 장기적인 로스율 최소화
-    rotation_penalty: int     # 2순위: 동점일 경우 눕혀서(원래 방향대로) 일관성 유지
-    neg_max_offcut: float     # 3순위: 단일 최대 잔재 크기 (음수)
+    neg_estimated_count: int  # ✨ 1순위: 이 방향으로 끝까지 채웠을 때 들어가는 총 개수 (많을수록 압승!)
+    linear_waste: float       # 2순위: 들어가는 개수가 같다면, 자투리 쓰레기가 적은 쪽
+    rotation_penalty: int     # 3순위: 동점이면 톱날 방향 안 바꾸고 자르던 대로 유지
+    neg_max_offcut: float     # 4순위: 단일 최대 잔재 크기
     node_id: str = field(compare=False)
     node: Node = field(compare=False)
     part: Part = field(compare=False)
@@ -158,13 +159,18 @@ def _best_cut_order(
 
 
 # ─────────────────────────────────────────────
-# Best-Fit 후보 선택 (Linear Waste + Rotation Penalty)
+# Best-Fit 후보 선택 (Max Count + Linear Waste)
 # ─────────────────────────────────────────────
 
-def _axis_waste(total: float, pdim: float, kerf: float) -> float:
+def _fit_count(total: float, pdim: float, kerf: float) -> int:
+    """해당 축 방향으로 몇 개나 들어가는지 계산"""
     if pdim > total + _EPSILON:
-        return total
-    count = int((total + kerf + _EPSILON) // (pdim + kerf))
+        return 0
+    return int((total + kerf + _EPSILON) // (pdim + kerf))
+
+def _axis_waste(total: float, pdim: float, kerf: float) -> float:
+    """축별 쓰레기 계산"""
+    count = _fit_count(total, pdim, kerf)
     if count <= 0:
         return total
     waste = total - (count * pdim) - (count - 1) * kerf
@@ -187,13 +193,19 @@ def _find_best_candidate(
             if not orientation.fits_in(node.dims):
                 continue
 
-            # 1. 선형 쓰레기 시뮬레이션
+            # ✨ 1. 예상 최대 수량 계산 (압도적인 1순위 판단 기준)
+            cx = _fit_count(node.dims.l, orientation.l, kerf)
+            cy = _fit_count(node.dims.w, orientation.w, kerf)
+            cz = _fit_count(node.dims.t, orientation.t, kerf)
+            est_count = cx * cy * cz
+
+            # 2. 선형 쓰레기 시뮬레이션
             lw_x = _axis_waste(node.dims.l, orientation.l, kerf)
             lw_y = _axis_waste(node.dims.w, orientation.w, kerf)
             lw_z = _axis_waste(node.dims.t, orientation.t, kerf)
             total_linear_waste = lw_x + lw_y + lw_z
 
-            # 2. 회전 페널티 계산 (일관성 유지)
+            # 3. 회전 페널티 계산 (일관성 유지)
             if orientation.l == part.dims.l and orientation.w == part.dims.w and orientation.t == part.dims.t:
                 rot_penalty = 0
             elif orientation.t == part.dims.t:
@@ -201,7 +213,6 @@ def _find_best_candidate(
             else:
                 rot_penalty = 2
 
-            # 3. 최대 잔재 절단 순서 선택
             order_result = _best_cut_order(node, orientation, kerf)
             if order_result is None:
                 continue
@@ -209,6 +220,7 @@ def _find_best_candidate(
             best_order, max_offcut = order_result
 
             candidate = PlacementCandidate(
+                neg_estimated_count=-est_count,  # 마이너스(-)를 붙여 숫자가 클수록 1등이 되게 함
                 linear_waste=total_linear_waste,
                 rotation_penalty=rot_penalty,
                 neg_max_offcut=-max_offcut,
