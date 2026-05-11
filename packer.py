@@ -29,30 +29,16 @@ class NodeHeap:
         self._removed: set = set()
 
     def push(self, node: Node):
-        # 정렬 키: (origin.x, origin.y, -depth, -volume)
-        #
-        # origin.x, origin.y (1·2순위, 오름차순):
-        #   XY 평면에서 원점(0,0) 구석에 가까운 공간을 먼저 채움
-        #   → 부품이 원장 한 구석으로 빽빽하게 몰려 반대편에 거대한 단일 잔재 형성
-        #
-        # -depth (3순위, 내림차순):
-        #   XY 좌표가 같을 때 절단 깊이가 깊은 자투리를 먼저 소진
-        #   → 새 원장 루트(depth=0)보다 기존 잔재(depth≥1)를 우선 처리
-        #
-        # -volume (4순위, 내림차순):
-        #   depth도 같으면 큰 공간 우선 → Best-Fit 선택 품질 보존
-        #
-        # Z축(두께) 보존:
-        #   origin.z를 키에 포함하지 않으므로 Z 좌표로 강제 정렬하지 않음
-        #   두께 절단 순서는 _offcut_score_for_order의 rem_t 가중치가 결정
-        heapq.heappush(
-            self._heap,
-            (node.origin.x, node.origin.y, -node.depth, -node.volume, node.node_id, node)
-        )
+        # 정렬 키: (-depth, -volume, node_id)
+        # -depth : 절단 깊이가 깊은 자투리(최근 발생)를 먼저 소진
+        # -volume: 같은 깊이면 큰 공간 우선 → Best-Fit 품질 보존
+        # XY 좌표 강제 없음: 얇은 부품이 Z축 틈새로 파고드는 현상 방지.
+        #   구석 몰아붙이기는 largest_offcut(2순위)·linear_waste(1순위) 평가가 담당.
+        heapq.heappush(self._heap, (-node.depth, -node.volume, node.node_id, node))
 
     def pop(self) -> Optional[Node]:
         while self._heap:
-            _ox, _oy, _neg_depth, _neg_vol, node_id, node = heapq.heappop(self._heap)
+            _neg_depth, _neg_vol, node_id, node = heapq.heappop(self._heap)
             if node_id in self._removed:
                 continue
             if node.state != NodeState.FREE:
@@ -295,11 +281,13 @@ def _pack_parts_single(
         if stock_index >= len(stock_pool): return False
 
         # ── Best-Fit Bin 선택 ──────────────────────────────────────────
-        # 미배치 부품들의 모든 허용 방향을 수집하고,
-        # 그 중 가장 큰 부품(최대 footprint 기준)이 들어갈 수 있는
-        # 가장 작은(usable_volume 최소) 원장을 우선 선택한다.
-        #
-        # 폴백: 조건을 만족하는 원장이 없으면 pool 순서대로 꺼낸다.
+        # 알고리즘:
+        #   1. 미배치 부품 전체의 허용 방향을 수집
+        #   2. 부피 내림차순으로 정렬 → "가장 큰 부품"부터 시도
+        #   3. 해당 부품이 들어갈 수 있는 원장들 중 volume이 가장 작은 것 선택
+        #      (Best-Fit Bin: 낭비 최소화)
+        #   4. 가장 큰 부품 기준으로 후보를 찾으면 즉시 확정 (더 작은 부품은 무시)
+        #   5. 조건 만족 원장 없으면 pool 순서대로 꺼냄 (폴백)
         remaining_dims: List[Dims] = []
         for pid, qty in remaining.items():
             if qty > 0:
@@ -307,10 +295,9 @@ def _pack_parts_single(
                     remaining_dims.append(orient)
 
         best_local_idx: Optional[int] = None
-        best_local_vol: float = float('inf')
 
         if remaining_dims:
-            # 가장 큰 부품 기준으로 내림차순 정렬
+            # 부피 내림차순: 가장 큰 부품부터 시도
             sorted_dims = sorted(
                 remaining_dims,
                 key=lambda d: _get_lwt(d)[0] * _get_lwt(d)[1] * _get_lwt(d)[2],
@@ -319,24 +306,29 @@ def _pack_parts_single(
 
             for candidate_dims in sorted_dims:
                 cd_l, cd_w, cd_t = _get_lwt(candidate_dims)
-                # 이 치수가 들어갈 수 있는 원장 중 volume이 최소인 것 찾기
-                found_for_this_dim = False
+
+                # 이 치수를 수용할 수 있는 원장 중 volume 최소인 것 탐색
+                best_vol_for_dim: float = float('inf')
+                best_idx_for_dim: Optional[int] = None
+
                 for i in range(stock_index, len(stock_pool)):
                     s = stock_pool[i]
-                    ud_l, ud_w, ud_t = _get_lwt(s.dims)  # _get_lwt으로 안전하게 추출
+                    ud_l, ud_w, ud_t = _get_lwt(s.dims)  # _get_lwt으로 AttributeError 방어
                     if (cd_l <= ud_l + _EPSILON and
                         cd_w <= ud_w + _EPSILON and
                         cd_t <= ud_t + _EPSILON):
                         uv = ud_l * ud_w * ud_t
-                        if uv < best_local_vol:
-                            best_local_vol = uv
-                            best_local_idx = i
-                        found_for_this_dim = True
-                # 가장 큰 부품이 들어가는 원장을 찾았으면 확정
-                if found_for_this_dim and best_local_idx is not None:
-                    break
+                        if uv < best_vol_for_dim:
+                            best_vol_for_dim = uv
+                            best_idx_for_dim = i
 
-        # 선택된 원장이 있으면 현재 위치와 swap 후 꺼냄
+                # 가장 큰 부품을 담는 원장을 찾았으면 즉시 확정하고 탐색 종료
+                if best_idx_for_dim is not None:
+                    best_local_idx = best_idx_for_dim
+                    break
+                # 이 부품은 어떤 원장에도 안 들어감 → 다음 (더 작은) 부품으로
+
+        # 선택된 원장이 현재 위치와 다르면 swap 후 꺼냄
         if best_local_idx is not None and best_local_idx != stock_index:
             stock_pool[stock_index], stock_pool[best_local_idx] = (
                 stock_pool[best_local_idx], stock_pool[stock_index]
@@ -373,9 +365,10 @@ def _pack_parts_single(
             heap.push(free_node)
 
     # 튜플 구조: (ox, oy, -depth, -vol, node_id, node) → node는 인덱스 5
-    free_nodes = [item[5] for item in heap._heap
-                  if item[5].node_id not in heap._removed
-                  and item[5].state == NodeState.FREE]
+    # 튜플 구조: (-depth, -volume, node_id, node) → node는 인덱스 3
+    free_nodes = [item[3] for item in heap._heap
+                  if item[3].node_id not in heap._removed
+                  and item[3].state == NodeState.FREE]
     
     return PackResult(
         occupied_nodes=occupied_nodes,
