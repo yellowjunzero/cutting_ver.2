@@ -1,7 +1,7 @@
 """
 packer.py — 탐색 & 배치 엔진 (Corner-First & 최대 단일 잔재 보존 알고리즘 - 오타 수정 완료)
 """
-from **future** import annotations
+from __future__ import annotations
 
 import heapq
 import time
@@ -88,7 +88,7 @@ node_id: str = field(compare=False)
 node: Node = field(compare=False)
 part: Part = field(compare=False)
 orientation: Dims = field(compare=False)
-cut_order: Tuple[CutAxis, …] = field(compare=False)
+cut_order: Tuple[CutAxis, ...] = field(compare=False)
 
 _ALL_AXES = [CutAxis.X, CutAxis.Y, CutAxis.Z]
 _ALL_ORDERS = list(permutations(_ALL_AXES))
@@ -101,7 +101,7 @@ t = dims_obj.t if hasattr(dims_obj, ‘t’) else dims_obj[2]
 return l, w, t
 
 def _offcut_score_for_order(
-node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, …], kerf: float
+node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, ...], kerf: float
 ) -> Optional[float]:
 n_l, n_w, n_t = _get_lwt(node.dims)
 p_l, p_w, p_t = _get_lwt(part_dims)
@@ -150,7 +150,7 @@ for axis in cut_order:
 return max_score
 ```
 
-def _best_cut_order(node: Node, part_dims: Dims, kerf: float) -> Optional[Tuple[Tuple[CutAxis, …], float]]:
+def _best_cut_order(node: Node, part_dims: Dims, kerf: float) -> Optional[Tuple[Tuple[CutAxis, ...], float]]:
 best_order, best_score = None, -1.0
 for order in _ALL_ORDERS:
 score = _offcut_score_for_order(node, part_dims, order, kerf)
@@ -256,7 +256,7 @@ return best
 ```
 
 def _place_part_on_node(
-node: Node, part: Part, orientation: Dims, cut_order: Tuple[CutAxis, …], kerf: float,
+node: Node, part: Part, orientation: Dims, cut_order: Tuple[CutAxis, ...], kerf: float,
 ) -> Tuple[Node, List[Node]]:
 p_l, p_w, p_t = _get_lwt(orientation)
 part_size = { CutAxis.X: p_l, CutAxis.Y: p_w, CutAxis.Z: p_t }
