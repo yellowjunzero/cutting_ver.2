@@ -18,6 +18,13 @@ _get_axis, _new_id, create_root_node, split_node,
 
 _EPSILON = 0.5
 
+# A급 잔재 보호 임계값: 짧은 변이 이 값 이상이면 ‘재사용 가능 우수 잔재’로 분류
+
+# 해당 잔재에 다른 종류 부품을 밀어 넣으면 페널티 부여
+
+_PRIME_OFFCUT_SHORT_EDGE = 300.0   # mm
+_PRIME_OFFCUT_PENALTY    = 1e15    # linear_waste에 가산 (사실상 후순위로 밀림)
+
 class NodeHeap:
 def **init**(self):
 self._heap: list = []
@@ -66,11 +73,17 @@ def __len__(self) -> int:
 
 @dataclass(order=True)
 class PlacementCandidate:
-neg_estimated_volume: float
+# 정렬 우선순위 (필드 선언 순서대로 비교)
+# 1순위: linear_waste        — 선형 로스 최소 (딱 맞는 자투리 공간 우선)
+# 2순위: neg_max_offcut      — 단일 잔재 최대 (절단 후 큰 덩어리 보존)
+# 3순위: neg_estimated_volume — 수량 많이 들어가는 곳
+# 4순위: rotation_penalty    — 회전 없는 방향 선호
+# 5순위: part_idx            — 동점 시 입력 순서로 결정적 정렬
 linear_waste: float
-part_idx: int
-rotation_penalty: int
 neg_max_offcut: float
+neg_estimated_volume: float
+rotation_penalty: int
+part_idx: int
 node_id: str = field(compare=False)
 node: Node = field(compare=False)
 part: Part = field(compare=False)
@@ -197,12 +210,41 @@ for part_id, qty in remaining_parts.items():
 
         best_order, max_offcut = order_result
 
+        # ── A급 잔재 파괴 페널티 ─────────────────────────────────────
+        # 현재 node가 우수 잔재(짧은 변 >= _PRIME_OFFCUT_SHORT_EDGE)이고,
+        # 배치하려는 부품이 이 node를 만든 직전 절단과 다른 종류일 때
+        # linear_waste에 거대 페널티를 가산 → 자연스럽게 후순위로 밀림
+        # (대안이 전혀 없을 때는 페널티가 있어도 배치되어 배치율 보존)
+        prime_penalty = 0.0
+        n_l_p, n_w_p, n_t_p = _get_lwt(node.dims)
+        short_edge_node = min(n_l_p, n_w_p)
+        if short_edge_node >= _PRIME_OFFCUT_SHORT_EDGE:
+            # 이 node를 만든 부모 절단의 원래 부품 종류를 역추적
+            # node.parent가 OCCUPIED child_a의 부모 = 직전 배치 부품의 형제 노드
+            prev_part_id: Optional[str] = None
+            ancestor = node.parent
+            while ancestor is not None:
+                if ancestor.placed_part is not None:
+                    prev_part_id = ancestor.placed_part.id
+                    break
+                # child_a 방향으로 역추적
+                if ancestor.child_a is not None and ancestor.child_a.placed_part is not None:
+                    prev_part_id = ancestor.child_a.placed_part.id
+                    break
+                ancestor = ancestor.parent
+
+            if prev_part_id is not None and prev_part_id != part.id:
+                prime_penalty = _PRIME_OFFCUT_PENALTY
+
+        adjusted_waste = total_linear_waste + prime_penalty
+        # ─────────────────────────────────────────────────────────────
+
         candidate = PlacementCandidate(
+            linear_waste=adjusted_waste,
+            neg_max_offcut=-max_offcut,
             neg_estimated_volume=-est_vol,
-            linear_waste=total_linear_waste,
-            part_idx=p_idx,                 
-            rotation_penalty=rot_penalty,   
-            neg_max_offcut=-max_offcut,     
+            rotation_penalty=rot_penalty,
+            part_idx=p_idx,
             node_id=node.node_id, node=node, part=part,
             orientation=orientation, cut_order=best_order,
         )
