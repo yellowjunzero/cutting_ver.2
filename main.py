@@ -1,6 +1,6 @@
-“””
-packer.py — 탐색 & 배치 엔진 (Corner-First & 최대 단일 잔재 보존 알고리즘 - 오타 수정 완료)
-“””
+"""
+packer.py — 탐색 & 배치 엔진
+"""
 from **future** import annotations
 
 import heapq
