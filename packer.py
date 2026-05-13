@@ -295,8 +295,17 @@ def _place_part_on_node(
     for axis in cut_order:
         pos   = part_size[axis]
         total = _get_axis(current.dims, axis)
+        
+        # 1. 공간과 부품 크기가 정확히 일치 (Kerf 불필요)
         if abs(total - pos) <= _EPSILON:
             continue
+            
+        # 2. 남은 공간이 Kerf 두께와 정확히 일치 (잔재 0, 톱밥으로 모두 소멸)
+        remainder = total - pos - kerf
+        if remainder <= _EPSILON:
+            continue
+            
+        # 3. 일반적인 절단 (child_b 잔재 노드 생성)
         child_a, child_b = split_node(current, axis, pos, kerf)
         new_free_nodes.append(child_b)
         current = child_a
