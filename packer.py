@@ -1,11 +1,16 @@
 """
-packer.py -- 탐색 & 배치 엔진 (Phase 3.1: Axis-Aware GRASP + 변별력 개선)
+packer.py -- 탐색 & 배치 엔진 (Phase 3.1 + Phase 4.0 확장)
 
 Phase 3.1 변경 사항:
   [A] _offcut_score_for_order: 스케일 독립 체적 + short_edge 선형 보정으로 재작성
   [B] A급 잔재 페널티 확률화: 70% 부여 / 30% 면제 -> 탐색 다양성 확보
   [C] GRASP 탐색 전략 다각화: 6가지 정렬 전략 균등 순환 (shuffle 비중 17%로 축소)
   [D] Axis-Aware 탐색 차원 추가: axis_bias 파라미터로 절단 축 선호도 제어
+
+Phase 4.0 추가:
+  StripAdapter      -- VirtualStrip → 임시 Part 변환 유틸리티
+  StripFirstPacker  -- BinAssignment 계획표를 실제 3D 배치로 실행
+  _pack_with_free_nodes -- free_nodes에 leftover_parts를 채우는 GRASP fallback
 """
 from __future__ import annotations
 
@@ -96,12 +101,16 @@ def _get_lwt(dims_obj) -> Tuple[float, float, float]:
     return l, w, t
 
 
-# ── [A] _offcut_score_for_order (정육면체 지향 + 가장 긴 축 절단 우대) ──
+# ── [A] _offcut_score_for_order (스케일 독립 체적 + short_edge 선형 보정) ──
 
 def _offcut_score_for_order(
-    node: Node, part_dims: Dims, cut_order: Tuple[CutAxis, ...], kerf: float,
+    node,
+    part_dims,
+    cut_order: Tuple[CutAxis, ...],
+    kerf: float,
     axis_bias: Tuple[float, float, float] = _DEFAULT_AXIS_BIAS,
 ) -> Optional[float]:
+    _REF_EDGE = 300.0
     _MIN_EDGE =  30.0
 
     n_l, n_w, n_t = _get_lwt(node.dims)
@@ -111,8 +120,11 @@ def _offcut_score_for_order(
     part_size = {CutAxis.X: p_l, CutAxis.Y: p_w, CutAxis.Z: p_t}
     bias_map  = {CutAxis.X: axis_bias[0], CutAxis.Y: axis_bias[1], CutAxis.Z: axis_bias[2]}
 
+    # [A] 핵심 변경: max -> sum
+    # max 방식: 각 step 중 최고 점수 1개만 반영 → X절단이 항상 독점해 동점 발생
+    # sum 방식: 모든 step의 잔재 점수를 합산 → 절단 순서 전체를 평가해 완전한 변별력
     total_score = 0.0
-    valid = False 
+    valid = False  # 최소 1개 step에서 유효 잔재가 발생해야 함
 
     for axis in cut_order:
         pos   = part_size[axis]
@@ -129,37 +141,23 @@ def _offcut_score_for_order(
         if remainder <= _EPSILON:
             remaining[axis] = pos
             continue
-            
-        # ✨ 핵심 로직: 현재 자르려는 축이 남은 공간 중 가장 긴 축인지 확인 (가래떡 썰기)
-        is_longest_axis = (total == max(remaining.values()))
 
         rem_l = remainder  if axis == CutAxis.X else remaining[CutAxis.X]
         rem_w = remainder  if axis == CutAxis.Y else remaining[CutAxis.Y]
         rem_t = remainder  if axis == CutAxis.Z else remaining[CutAxis.Z]
 
-        min_edge = min(rem_l, rem_w, rem_t)
-        max_edge = max(rem_l, rem_w, rem_t)
+        short_edge = min(rem_l, rem_w)
 
-        if min_edge >= _MIN_EDGE:
+        if short_edge >= _MIN_EDGE:
             remainder_vol = rem_l * rem_w * rem_t
-            
-            # ✨ 정육면체 지향 (Squarity) 보너스
-            # 비율이 1.0(정육면체)에 가까울수록 높은 점수
-            squarity = min_edge / max_edge if max_edge > 0 else 1.0
-            cube_bonus = 1.0 + (squarity * 5.0) 
-            
-            # ✨ 가장 긴 축(Longest Axis First) 절단 우대
-            # 폭(W)이나 두께(T) 대신 길이(L)를 먼저 절단하여 
-            # 원장의 폭/두께를 온전히 보존하는 순서에 강력한 가중치 부여
-            if is_longest_axis:
-                cube_bonus *= 3.0
-                
-            step_score    = remainder_vol * cube_bonus * bias_map[axis]
+            edge_bonus    = max(short_edge / _REF_EDGE, 1.0)
+            step_score    = remainder_vol * edge_bonus * bias_map[axis]
             total_score  += step_score
             valid = True
 
         remaining[axis] = pos
 
+    # 유효 잔재가 하나도 없으면 0 반환 (None 아님: 절단 자체는 가능)
     return total_score if valid else 0.0
 
 
@@ -302,17 +300,8 @@ def _place_part_on_node(
     for axis in cut_order:
         pos   = part_size[axis]
         total = _get_axis(current.dims, axis)
-        
-        # 1. 공간과 부품 크기가 정확히 일치 (Kerf 불필요)
         if abs(total - pos) <= _EPSILON:
             continue
-            
-        # 2. 남은 공간이 Kerf 두께와 정확히 일치 (잔재 0, 톱밥으로 모두 소멸)
-        remainder = total - pos - kerf
-        if remainder <= _EPSILON:
-            continue
-            
-        # 3. 일반적인 절단 (child_b 잔재 노드 생성)
         child_a, child_b = split_node(current, axis, pos, kerf)
         new_free_nodes.append(child_b)
         current = child_a
@@ -546,3 +535,404 @@ def pack_parts(
 
     best_result.processing_time = time.perf_counter() - start_total
     return best_result
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 4.0 — StripAdapter
+# ═══════════════════════════════════════════════════════════════════
+
+class StripAdapter:
+    """
+    VirtualStrip을 core.py의 Part처럼 다룰 수 있게 하는 변환 유틸리티.
+
+    _place_part_on_node는 Part를 받으므로, VirtualStrip의 외형 치수(dims)를
+    가진 임시 Part로 변환한다.  core.py는 한 줄도 수정하지 않는다.
+
+    생성된 임시 Part의 id 형식: "__strip__{strip_id}"
+    StripFirstPacker는 이 prefix로 배치 결과가 Strip인지 일반 부품인지 구분한다.
+    """
+
+    STRIP_ID_PREFIX = "__strip__"
+
+    @staticmethod
+    def strip_as_part(strip: "VirtualStrip") -> Part:  # type: ignore[name-defined]
+        """
+        VirtualStrip → 임시 Part 변환.
+
+        - dims: strip.dims 그대로 (외형 치수)
+        - qty: 1 (Strip은 항상 단일 유닛)
+        - lock_z: True, allow_xy_rotation: False
+          (VirtualStrip 방향은 이미 DP/Group 단계에서 결정됨)
+        - color: strip.source_plan의 첫 번째 내부 부품 색상 상속
+                 (3D 뷰어에서 Strip 내 주요 부품 색상으로 표시)
+
+        Args:
+            strip: 변환할 VirtualStrip
+
+        Returns:
+            임시 Part (id 앞에 STRIP_ID_PREFIX 붙음)
+        """
+        # 내부 부품 중 첫 번째 색상 상속 (없으면 기본색)
+        color = "#7c3aed"  # 기본: 보라색 (Strip 전용)
+        if strip.internal_parts:
+            first_part = strip.internal_parts[0][0]
+            if hasattr(first_part, "color") and first_part.color:
+                color = first_part.color
+
+        return Part(
+            id=f"{StripAdapter.STRIP_ID_PREFIX}{strip.strip_id}",
+            dims=strip.dims,
+            qty=1,
+            lock_z=True,
+            allow_xy_rotation=False,
+            priority=10,   # Strip은 일반 부품보다 높은 우선순위
+            color=color,
+        )
+
+    @staticmethod
+    def is_strip_part(part: Part) -> bool:
+        """part가 Strip 어댑터에서 생성된 임시 Part인지 확인"""
+        return part.id.startswith(StripAdapter.STRIP_ID_PREFIX)
+
+    @staticmethod
+    def extract_strip_id(part: Part) -> str:
+        """임시 Part에서 원본 strip_id 추출"""
+        return part.id[len(StripAdapter.STRIP_ID_PREFIX):]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 4.0 — _pack_with_free_nodes (GRASP fallback)
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class FallbackResult:
+    """GRASP fallback 실행 결과"""
+    occupied_nodes: List[Node]
+    unplaced: Dict[str, int]
+    processing_time: float
+
+
+def _pack_with_free_nodes(
+    free_nodes: List[Node],
+    leftover_parts: List[Part],
+    kerf: float,
+    axis_bias: Tuple[float, float, float] = _DEFAULT_AXIS_BIAS,
+) -> FallbackResult:
+    """
+    Strip 배치 후 남은 free_nodes에 leftover_parts를 GRASP 방식으로 채운다.
+
+    pack_parts()나 _pack_parts_single()과 달리,
+    새 Stock을 열지 않고 이미 존재하는 free_nodes만 사용한다.
+    이것이 기존 GRASP와의 유일한 차이점이다.
+
+    Args:
+        free_nodes:     Strip 배치 후 남은 FREE 상태 Node 목록
+        leftover_parts: VirtualStripFactory가 반환한 미처리 잔여 부품
+        kerf:           톱날 두께
+        axis_bias:      절단 축 선호도 가중치
+
+    Returns:
+        FallbackResult(occupied_nodes, unplaced, processing_time)
+    """
+    start = time.perf_counter()
+
+    if not leftover_parts or not free_nodes:
+        return FallbackResult([], {}, 0.0)
+
+    parts_by_id: Dict[str, Part] = {p.id: p for p in leftover_parts}
+    remaining: Dict[str, int] = {p.id: p.qty for p in leftover_parts}
+    occupied: List[Node] = []
+
+    # free_nodes를 NodeHeap에 직접 push (새 원장 열기 없음)
+    heap = NodeHeap()
+    for fn in free_nodes:
+        if fn.state == NodeState.FREE:
+            heap.push(fn)
+
+    while any(v > 0 for v in remaining.values()):
+        node = heap.pop()
+        if node is None:
+            break   # 더 이상 사용 가능한 공간 없음
+
+        candidate = _find_best_candidate(node, remaining, parts_by_id, kerf, axis_bias)
+        if candidate is None:
+            node.state = NodeState.DISCARDED
+            continue
+
+        occ, new_free = _place_part_on_node(
+            candidate.node, candidate.part,
+            candidate.orientation, candidate.cut_order, kerf,
+        )
+        occupied.append(occ)
+        remaining[candidate.part.id] -= 1
+
+        for fn in new_free:
+            heap.push(fn)
+
+    return FallbackResult(
+        occupied_nodes=occupied,
+        unplaced={k: v for k, v in remaining.items() if v > 0},
+        processing_time=time.perf_counter() - start,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 4.0 — StripFirstPacker
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass
+class StripPlacementRecord:
+    """
+    Strip 배치 완료 후 기록.
+    occupied_node: Strip이 OCCUPIED로 마킹된 Node
+    strip:         원본 VirtualStrip
+    free_nodes:    이 Strip 배치로 생긴 FREE child_b 노드들
+    """
+    occupied_node: Node
+    strip: "VirtualStrip"  # type: ignore[name-defined]
+    free_nodes: List[Node]
+
+
+@dataclass
+class Phase4PackResult:
+    """
+    phase4.py pack_parts_phase4()의 최종 반환값.
+    """
+    occupied_nodes: List[Node]       # Strip 배치 + fallback 배치 통합
+    strip_records: List[StripPlacementRecord]
+    unplaced: Dict[str, int]         # 끝내 배치 못한 부품 {id: qty}
+    processing_time: float
+    stocks_used: int
+    free_nodes: List[Node]           # 최종 배치 후 남은 FREE 노드
+    strip_assignment_rate: float     # Strip 배정 성공률
+
+
+class StripFirstPacker:
+    """
+    BinAssignment 계획표를 실제 3D Guillotine 배치로 실행하는 패커.
+
+    실행 순서:
+      1. BinAssignment를 slot(원장 인스턴스) 기준으로 그룹화
+      2. 각 슬롯에 대해 독립적인 root_node 생성
+      3. 슬롯에 배정된 Strips를 순서대로 _place_part_on_node로 배치
+         (Strip은 StripAdapter로 임시 Part 변환 후 사용)
+      4. 모든 배치 후 남은 free_nodes를 수집
+      5. _pack_with_free_nodes()로 leftover_parts GRASP fallback 실행
+    """
+
+    # ──────────────────────────────────────────────────────────────
+    # 공개 API
+    # ──────────────────────────────────────────────────────────────
+
+    def execute(
+        self,
+        assignments: List["BinAssignment"],       # type: ignore[name-defined]
+        unassigned_strips: List["VirtualStrip"],  # type: ignore[name-defined]
+        leftover_parts: List[Part],
+        kerf: float,
+        axis_bias: Tuple[float, float, float] = _DEFAULT_AXIS_BIAS,
+    ) -> Phase4PackResult:
+        """
+        BinAssignment 계획표를 실행하여 Phase4PackResult를 반환한다.
+
+        Args:
+            assignments:       GlobalBinEvaluator가 생성한 배정 목록
+            unassigned_strips: 어느 원장에도 배정되지 못한 VirtualStrip 목록
+                               (현재 버전에서는 미사용; 향후 재시도 로직 확장용)
+            leftover_parts:    VirtualStripFactory의 leftover + unassigned_strips
+                               내부 부품들 (GRASP fallback 입력)
+            kerf:              톱날 두께
+            axis_bias:         절단 축 선호도 (fallback GRASP에 전달)
+
+        Returns:
+            Phase4PackResult
+        """
+        start = time.perf_counter()
+
+        # ── 1. 슬롯별 배치 실행 ────────────────────────────────────
+        strip_records: List[StripPlacementRecord] = []
+        all_free_nodes: List[Node] = []
+        stocks_used_ids: set = set()
+
+        # slot_id 기준으로 그룹화 (동일 슬롯에 복수 Strip 배정 처리)
+        slot_groups: Dict[str, List["BinAssignment"]] = {}
+        for a in assignments:
+            slot_groups.setdefault(a.slot_id, []).append(a)
+
+        for slot_id, slot_assignments in slot_groups.items():
+            records, free_nodes = self._place_slot_strips(
+                slot_assignments, kerf
+            )
+            strip_records.extend(records)
+            all_free_nodes.extend(free_nodes)
+            if slot_assignments:
+                stocks_used_ids.add(slot_assignments[0].slot.stock.id)
+
+        # ── 2. GRASP fallback: leftover_parts를 free_nodes에 채움 ──
+        fallback_result = _pack_with_free_nodes(
+            all_free_nodes, leftover_parts, kerf, axis_bias
+        )
+
+        # ── 3. 최종 결과 조립 ─────────────────────────────────────
+        all_occupied = (
+            [r.occupied_node for r in strip_records]
+            + fallback_result.occupied_nodes
+        )
+
+        # 최종 FREE 노드 수집 (fallback 후 남은 것)
+        final_free = self._collect_final_free(all_free_nodes, fallback_result)
+
+        total_strips = len(assignments) + len(unassigned_strips)
+        rate = len(assignments) / total_strips if total_strips > 0 else 1.0
+
+        return Phase4PackResult(
+            occupied_nodes=all_occupied,
+            strip_records=strip_records,
+            unplaced=fallback_result.unplaced,
+            processing_time=time.perf_counter() - start,
+            stocks_used=len(stocks_used_ids),
+            free_nodes=final_free,
+            strip_assignment_rate=rate,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # 슬롯 단위 배치
+    # ──────────────────────────────────────────────────────────────
+
+    def _place_slot_strips(
+        self,
+        slot_assignments: List["BinAssignment"],
+        kerf: float,
+    ) -> Tuple[List[StripPlacementRecord], List[Node]]:
+        """
+        단일 슬롯(원장 인스턴스)에 배정된 모든 Strip을 순서대로 배치한다.
+
+        슬롯별로 독립적인 root_node를 생성하여 Strip을 순차 배치한다.
+        첫 Strip은 root_node 전체 공간에 배치하고,
+        이후 Strip은 이전 배치가 남긴 child_b (X축 잔재 노드)에 배치한다.
+
+        Returns:
+            (strip_records, all_free_nodes)
+            all_free_nodes: 이 슬롯의 모든 배치에서 발생한 FREE 노드들
+        """
+        if not slot_assignments:
+            return [], []
+
+        stock = slot_assignments[0].slot.stock
+        root = create_root_node(stock)
+
+        records: List[StripPlacementRecord] = []
+        slot_free_nodes: List[Node] = []
+
+        # 현재 배치할 노드 (처음엔 root, 이후엔 X축 잔재)
+        current_node: Optional[Node] = root
+
+        for assignment in slot_assignments:
+            strip = assignment.strip
+            if current_node is None:
+                # 더 이상 배치할 공간이 없음 (이론상 BinSlot.can_fit이 보장하지만 방어)
+                break
+
+            record, next_node, free_nodes = self._place_single_strip(
+                strip, current_node, kerf
+            )
+            if record is None:
+                # 배치 실패 (공간 부족) → 이 슬롯의 나머지 Strip도 건너뜀
+                break
+
+            records.append(record)
+            slot_free_nodes.extend(free_nodes)
+            # 다음 Strip은 X축 잔재 노드(child_b)에 배치
+            current_node = next_node
+
+        # 마지막 current_node가 FREE이면 잔재로 등록
+        if current_node is not None and current_node.state == NodeState.FREE:
+            slot_free_nodes.append(current_node)
+
+        return records, slot_free_nodes
+
+    def _place_single_strip(
+        self,
+        strip: "VirtualStrip",
+        node: Node,
+        kerf: float,
+    ) -> Tuple[Optional[StripPlacementRecord], Optional[Node], List[Node]]:
+        """
+        단일 Strip을 node에 배치한다.
+
+        배치 전략:
+          - StripAdapter로 Strip을 임시 Part로 변환
+          - _best_cut_order로 최적 절단 순서 결정
+          - _place_part_on_node로 물리 배치 실행
+
+        Returns:
+            (record, x_axis_child_b, other_free_nodes)
+            record: 배치 성공 시 StripPlacementRecord, 실패 시 None
+            x_axis_child_b: X축 첫 절단 후 남은 잔재 노드 (다음 Strip 배치용)
+                            첫 절단이 X축이 아니거나 없으면 None
+            other_free_nodes: X축 잔재 외 나머지 FREE 노드들 (W, T 방향 잔재)
+        """
+        strip_part = StripAdapter.strip_as_part(strip)
+        strip_dims = strip.dims
+
+        # 크기 적합성 최종 확인 (방어적)
+        if not strip_dims.fits_in(node.dims):
+            return None, None, []
+
+        # 최적 절단 순서 결정
+        order_result = _best_cut_order(node, strip_dims, kerf, _DEFAULT_AXIS_BIAS)
+        if order_result is None:
+            return None, None, []
+        cut_order, _ = order_result
+
+        # 물리 배치 실행
+        try:
+            occupied, free_nodes = _place_part_on_node(
+                node, strip_part, strip_dims, cut_order, kerf
+            )
+        except Exception:
+            return None, None, []
+
+        # occupied_node에 원본 Strip 참조 저장 (역추적용)
+        # Part 객체는 이미 strip_part이므로 placed_part.id로 구분 가능
+        occupied.placed_part = strip_part  # 이미 설정되지만 명시적 재확인
+
+        record = StripPlacementRecord(
+            occupied_node=occupied,
+            strip=strip,
+            free_nodes=list(free_nodes),
+        )
+
+        # X축 잔재(next_node)와 나머지 잔재(other_free) 분리
+        # 절단 순서의 첫 번째 축이 X이고 해당 free_node가 존재하면 next_node로 사용
+        # → 동일 슬롯의 다음 Strip이 이어서 배치되는 공간
+        next_node: Optional[Node] = None
+        other_free: List[Node] = []
+
+        for fn in free_nodes:
+            # X축 첫 절단의 child_b를 찾음:
+            # cut.axis == X이고 origin.x가 node.origin.x보다 크면 X-방향 잔재
+            if (fn.cut is not None
+                    and fn.cut.axis == CutAxis.X
+                    and fn.origin.x > node.origin.x + _EPSILON
+                    and next_node is None):
+                next_node = fn
+            else:
+                other_free.append(fn)
+
+        return record, next_node, other_free
+
+    # ──────────────────────────────────────────────────────────────
+    # 최종 FREE 노드 수집
+    # ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _collect_final_free(
+        all_free_nodes: List[Node],
+        fallback: FallbackResult,
+    ) -> List[Node]:
+        """
+        Fallback 배치 후 남은 최종 FREE 노드만 반환한다.
+        (OCCUPIED/SPLIT/DISCARDED 상태로 바뀐 노드 제외)
+        """
+        return [n for n in all_free_nodes if n.state == NodeState.FREE]
